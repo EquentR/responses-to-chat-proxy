@@ -286,16 +286,22 @@ func (s *Server) passthroughStream(w http.ResponseWriter, r *http.Request, body 
 	w.WriteHeader(http.StatusOK)
 
 	flusher, _ := w.(http.Flusher)
+	normalizer := newChatCompletionStreamNormalizer()
 	buffer := make([]byte, 4096)
 	for {
 		n, readErr := resp.Body.Read(buffer)
 		if n > 0 {
-			writeSSEChunks(w, flusher, buffer[:n])
+			for _, event := range normalizer.Feed(buffer[:n]) {
+				writeSSEChunks(w, flusher, event)
+			}
 		}
 		if readErr == nil {
 			continue
 		}
 		if errors.Is(readErr, io.EOF) {
+			for _, event := range normalizer.Finish() {
+				writeSSEChunks(w, flusher, event)
+			}
 			return
 		}
 		writeSSEChunks(w, flusher, sseError(fmt.Sprintf("Upstream request failed: %v", readErr), "upstream_request_failed"))

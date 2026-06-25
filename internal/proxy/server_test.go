@@ -192,3 +192,81 @@ func TestForwardUnknownV1SkipsProxyAuth(t *testing.T) {
 	}
 	assertContains(t, recorder.Body.String(), `"id":"m1"`)
 }
+
+func TestChatCompletionsStreamSynthesizesFinishReasonOnEOF(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: " + mustJSON(map[string]any{
+			"id":      "chatcmpl-abc",
+			"object":  "chat.completion.chunk",
+			"created": 123,
+			"model":   "test-model",
+			"choices": []any{
+				map[string]any{
+					"index":         0,
+					"delta":         map[string]any{"role": "assistant", "content": "Hi"},
+					"finish_reason": nil,
+				},
+			},
+		}) + "\n\n"))
+	}))
+	defer upstream.Close()
+
+	server := NewServer(Config{
+		UpstreamBaseURL: upstream.URL + "/v1",
+		RequestTimeout:  secondsToDuration(5),
+		StreamTimeout:   secondsToDuration(5),
+		VerifySSL:       true,
+	})
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test-model","messages":[],"stream":true}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	body := recorder.Body.String()
+	assertContains(t, body, `"finish_reason":"stop"`)
+	assertContains(t, body, "data: [DONE]")
+}
+
+func TestChatCompletionsStreamInsertsFinishReasonBeforeDone(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: " + mustJSON(map[string]any{
+			"id":      "chatcmpl-abc",
+			"object":  "chat.completion.chunk",
+			"created": 123,
+			"model":   "test-model",
+			"choices": []any{
+				map[string]any{
+					"index":         0,
+					"delta":         map[string]any{"content": "Hi"},
+					"finish_reason": nil,
+				},
+			},
+		}) + "\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	server := NewServer(Config{
+		UpstreamBaseURL: upstream.URL + "/v1",
+		RequestTimeout:  secondsToDuration(5),
+		StreamTimeout:   secondsToDuration(5),
+		VerifySSL:       true,
+	})
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test-model","messages":[],"stream":true}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	body := recorder.Body.String()
+	finishIndex := strings.Index(body, `"finish_reason":"stop"`)
+	doneIndex := strings.Index(body, "data: [DONE]")
+	if finishIndex < 0 || doneIndex < 0 || finishIndex > doneIndex {
+		t.Fatalf("expected synthesized finish_reason before [DONE], body=%s", body)
+	}
+}
