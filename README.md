@@ -32,6 +32,8 @@ VERIFY_SSL=true
 LOG_LEVEL=info
 ```
 
+If `UPSTREAM_API_KEY` is left empty, the proxy forwards the caller's `Authorization`, `x-api-key`, or `x-goog-api-key` header upstream unchanged.
+
 ## Run locally
 
 ```bash

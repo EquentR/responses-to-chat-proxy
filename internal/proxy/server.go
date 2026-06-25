@@ -357,7 +357,10 @@ func copyHeaders(incoming http.Header, upstreamAPIKey string) http.Header {
 	headers.Set("Content-Type", "application/json")
 	for key, values := range incoming {
 		lower := strings.ToLower(key)
-		if lower == "host" || lower == "content-length" || lower == "authorization" || lower == "accept-encoding" || lower == "connection" {
+		if lower == "host" || lower == "content-length" || lower == "accept-encoding" || lower == "connection" {
+			continue
+		}
+		if upstreamAPIKey != "" && (lower == "authorization" || lower == "x-api-key" || lower == "x-goog-api-key") {
 			continue
 		}
 		for _, value := range values {

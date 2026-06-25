@@ -72,6 +72,59 @@ func TestResponsesEndpointConvertsUpstreamResponse(t *testing.T) {
 	}
 }
 
+func TestResponsesEndpointForwardsCallerAuthWhenUpstreamKeyMissing(t *testing.T) {
+	tests := []struct {
+		name        string
+		headerName  string
+		headerValue string
+	}{
+		{name: "authorization", headerName: "Authorization", headerValue: "Bearer " + "test"},
+		{name: "x-api-key", headerName: "x-api-key", headerValue: "caller-secret"},
+		{name: "x-goog-api-key", headerName: "x-goog-api-key", headerValue: "caller-secret"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if got := r.Header.Get(tt.headerName); got != tt.headerValue {
+					t.Fatalf("unexpected %s header: %q", tt.headerName, got)
+				}
+
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"id":      "chatcmpl-abc",
+					"created": 123,
+					"model":   "test-model",
+					"choices": []any{
+						map[string]any{
+							"finish_reason": "stop",
+							"message":       map[string]any{"role": "assistant", "content": "Hi"},
+						},
+					},
+				})
+			}))
+			defer upstream.Close()
+
+			server := NewServer(Config{
+				UpstreamBaseURL: upstream.URL + "/v1",
+				RequestTimeout:  secondsToDuration(5),
+				StreamTimeout:   secondsToDuration(5),
+				VerifySSL:       true,
+			})
+
+			request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"test-model","input":"hello"}`))
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set(tt.headerName, tt.headerValue)
+			recorder := httptest.NewRecorder()
+
+			server.ServeHTTP(recorder, request)
+
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+			}
+		})
+	}
+}
+
 func TestForwardUnknownV1Request(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/models" {
