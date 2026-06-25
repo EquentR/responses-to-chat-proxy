@@ -139,7 +139,7 @@ func (n *chatCompletionStreamNormalizer) maybeSynthesizeFinishReason() [][]byte 
 	n.sawFinishReason = true
 
 	chunk := map[string]any{
-		"object": valueOrDefault(n.lastObject, "chat.completion.chunk"),
+		"object":  valueOrDefault(n.lastObject, "chat.completion.chunk"),
 		"choices": n.finishChoices(),
 	}
 	if n.lastID != "" {
