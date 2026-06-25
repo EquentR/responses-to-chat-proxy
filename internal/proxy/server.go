@@ -83,6 +83,12 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	chatRequest := ConvertRequest(body, s.config)
+
+	// Apply cache-optimizer: inject cache_control breakpoints for prompt caching.
+	if s.config.CacheOptimizer {
+		InjectCacheBreakpoints(chatRequest, "1h")
+	}
+
 	if boolValue(chatRequest["stream"]) {
 		s.streamResponses(w, r, body, chatRequest)
 		return
@@ -108,6 +114,80 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.passthroughNormal(w, r, body)
+}
+
+// forwardConvertedWithRectifier forwards a converted request, retrying once if
+// the upstream returns a thinking signature error that can be rectified by
+// stripping thinking blocks.
+func (s *Server) forwardConvertedWithRectifier(w http.ResponseWriter, r *http.Request, original, chatRequest map[string]any) {
+	bodyBytes, err := json.Marshal(chatRequest)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errorPayload("Request conversion error.", "invalid_request_error", "conversion_error"))
+		return
+	}
+
+	response, err := s.doRequest(
+		r.Context(), s.normalClient, http.MethodPost,
+		s.config.UpstreamBaseURL+"/chat/completions",
+		copyHeaders(r.Header, s.config.UpstreamAPIKey),
+		bytes.NewReader(bodyBytes),
+	)
+	if err != nil {
+		s.writeUpstreamRequestError(w, err)
+		return
+	}
+
+	if response.StatusCode >= 400 {
+		respBody, readErr := io.ReadAll(response.Body)
+		response.Body.Close()
+		if readErr != nil {
+			writeJSON(w, response.StatusCode, errorPayload("Failed to read upstream error.", "upstream_error", "read_error"))
+			return
+		}
+		errStr := TryParseErrorBody(respBody)
+		if ShouldRectifyThinkingSignature(errStr) {
+			stripped := cloneMap(chatRequest)
+			if StripThinkingBlocks(stripped) {
+				strippedBytes, _ := json.Marshal(stripped)
+				retryResp, retryErr := s.doRequest(
+					r.Context(), s.normalClient, http.MethodPost,
+					s.config.UpstreamBaseURL+"/chat/completions",
+					copyHeaders(r.Header, s.config.UpstreamAPIKey),
+					bytes.NewReader(strippedBytes),
+				)
+				if retryErr != nil {
+					s.writeUpstreamRequestError(w, retryErr)
+					return
+				}
+				defer retryResp.Body.Close()
+				retryData := parseResponseJSON(retryResp)
+				if retryResp.StatusCode >= 400 {
+					writeJSON(w, retryResp.StatusCode, NormalizeUpstreamError(retryData))
+					return
+				}
+				writeJSON(w, retryResp.StatusCode, ConvertResponse(retryData, original))
+				return
+			}
+		}
+		writeJSON(w, response.StatusCode, NormalizeUpstreamError(parseResponseJSONFromBytes(respBody)))
+		return
+	}
+	defer response.Body.Close()
+
+	responseData := parseResponseJSON(response)
+	writeJSON(w, response.StatusCode, ConvertResponse(responseData, original))
+}
+
+func parseResponseJSONFromBytes(raw []byte) map[string]any {
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return map[string]any{"raw_response": string(raw)}
+	}
+	dict, ok := value.(map[string]any)
+	if ok {
+		return dict
+	}
+	return map[string]any{"raw_response": value}
 }
 
 func (s *Server) forwardUnknownV1(w http.ResponseWriter, r *http.Request) {

@@ -7,14 +7,14 @@ import (
 
 func TestConvertRequestStringInput(t *testing.T) {
 	converted := ConvertRequest(map[string]any{
-		"model":             "test-model",
+		"model":             "gpt-5.1",
 		"instructions":      "Be concise.",
 		"input":             "Hello",
 		"max_output_tokens": 20,
 		"reasoning":         map[string]any{"effort": "low"},
 	}, Config{})
 
-	if converted["model"] != "test-model" {
+	if converted["model"] != "gpt-5.1" {
 		t.Fatalf("unexpected model: %v", converted["model"])
 	}
 

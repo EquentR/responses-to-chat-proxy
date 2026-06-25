@@ -12,6 +12,7 @@ import (
 type Config struct {
 	UpstreamBaseURL       string
 	UpstreamAPIKey        string
+	ReasoningMode         ReasoningMode // reasoning parameter mapping mode
 	ProxyAPIKey           string
 	ModelOverride         string
 	Host                  string
@@ -20,6 +21,7 @@ type Config struct {
 	StreamTimeout         time.Duration
 	VerifySSL             bool
 	LogLevel              string
+	CacheOptimizer        bool // inject cache_control breakpoints
 	RequestTimeoutSeconds float64
 	StreamTimeoutSeconds  float64
 }
