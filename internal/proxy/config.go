@@ -42,6 +42,10 @@ func LoadConfigFromEnv(dotEnvPath string) (Config, error) {
 		StreamTimeoutSeconds:  envFloat("STREAM_TIMEOUT_SECONDS", 300),
 		VerifySSL:             envBool("VERIFY_SSL", true),
 		LogLevel:              envString("LOG_LEVEL", "info"),
+		// ReasoningMode overrides model-name inference of the reasoning parameter
+		// form sent upstream. Empty falls back to model/base-URL inference. Allowed:
+		// effort, effort_obj, thinking, thinking_only, enable_thinking, reasoning_split.
+		ReasoningMode: ReasoningMode(envString("REASONING_MODE", "")),
 	}
 
 	cfg.UpstreamBaseURL = strings.TrimRight(cfg.UpstreamBaseURL, "/")

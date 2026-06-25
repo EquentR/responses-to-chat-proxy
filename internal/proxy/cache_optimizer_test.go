@@ -98,22 +98,22 @@ func TestInjectCacheBreakpointsSkipsThinkingBlocks(t *testing.T) {
 	}
 	msgs := body["messages"].([]any)
 	content := msgs[1].(map[string]any)["content"].([]any)
-	// thinking block (index 0) — no cache_control
+	// thinking block (index 0) -- no cache_control
 	if content[0].(map[string]any)["cache_control"] != nil {
 		t.Fatal("thinking block should not have cache_control")
 	}
-	// text block (index 1) — should have cache_control
+	// text block (index 1) -- should have cache_control
 	if content[1].(map[string]any)["cache_control"] == nil {
 		t.Fatal("text block should have cache_control")
 	}
-	// redacted_thinking block (index 2) — no cache_control
+	// redacted_thinking block (index 2) -- no cache_control
 	if content[2].(map[string]any)["cache_control"] != nil {
 		t.Fatal("redacted_thinking block should not have cache_control")
 	}
 }
 
 func TestInjectCacheBreakpointsMaxFourExisting(t *testing.T) {
-	// 4 existing breakpoints — should only upgrade TTL, not inject new ones
+	// 4 existing breakpoints -- should only upgrade TTL, not inject new ones
 	body := map[string]any{
 		"model": "test",
 		"tools": []any{

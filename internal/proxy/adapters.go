@@ -9,7 +9,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// Tool conversion context — mirrors cc-switch CodexToolContext
+// Tool conversion context -- mirrors cc-switch CodexToolContext
 // ---------------------------------------------------------------------------
 
 type toolSpec struct {
@@ -73,17 +73,21 @@ const (
 type ReasoningMode string
 
 const (
-	// ReasoningPassthrough — leave reasoning field as-is (default for unknown providers).
+	// ReasoningPassthrough --leave reasoning field as-is (default for unknown providers).
 	ReasoningPassthrough ReasoningMode = ""
-	// ReasoningEffort — map to top-level reasoning_effort (OpenAI).
+	// ReasoningEffort -- map to top-level reasoning_effort (OpenAI / GPT-5).
 	ReasoningEffort ReasoningMode = "effort"
-	// ReasoningThinking — map to thinking.type + reasoning_effort (DeepSeek).
+	// ReasoningThinking -- map to thinking.type + reasoning_effort (DeepSeek).
 	ReasoningThinking ReasoningMode = "thinking"
-	// ReasoningEnableThinking — map to enable_thinking (SiliconFlow, Qwen on some platforms).
+	// ReasoningThinkingOnly -- map to thinking.type only, no reasoning_effort.
+	// Used for GLM / Kimi / MiMo and other providers whose upstream accepts the
+	// "thinking" object but rejects a top-level "reasoning_effort".
+	ReasoningThinkingOnly ReasoningMode = "thinking_only"
+	// ReasoningEnableThinking --map to enable_thinking (SiliconFlow, Qwen on some platforms).
 	ReasoningEnableThinking ReasoningMode = "enable_thinking"
-	// ReasoningSplit — map to reasoning_split (MiniMax).
+	// ReasoningSplit --map to reasoning_split (MiniMax).
 	ReasoningSplit ReasoningMode = "reasoning_split"
-	// ReasoningEffortObj — map to reasoning.effort nested object (OpenRouter).
+	// ReasoningEffortObj --map to reasoning.effort nested object (OpenRouter).
 	ReasoningEffortObj ReasoningMode = "effort_obj"
 )
 
@@ -105,7 +109,7 @@ var extraChatPassthroughFields = []string{
 }
 
 // ===========================================================================
-// ConvertRequest — responses → chat completions
+// ConvertRequest --responses --chat completions
 // ===========================================================================
 
 func ConvertRequest(data map[string]any, cfg Config) map[string]any {
@@ -194,13 +198,18 @@ func applyReasoningOptions(chatData, data map[string]any, model string, cfg Conf
 	effort := strings.ToLower(stringValue(reasoning["effort"]))
 	enabled := effort != "" && effort != "none" && effort != "off" && effort != "disabled"
 
+	// Resolve the reasoning parameter form for this upstream.
+	// An explicit REASONING_MODE (cfg.ReasoningMode) always wins; this mirrors
+	// cc-switch's provider-level codexChatReasoning declaration and lets users
+	// with a custom Chat-Completions-compatible upstream tell the proxy which
+	// field the upstream actually accepts. When unset, fall back to inference
+	// from model name / base URL.
 	mode := cfg.ReasoningMode
 	if mode == "" {
-		if isOSeriesModel(model) || supportsReasoningEffort(model) {
-			mode = ReasoningEffort
-		} else {
-			return
-		}
+		mode = inferReasoningMode(model, cfg.UpstreamBaseURL)
+	}
+	if mode == ReasoningPassthrough {
+		return
 	}
 
 	switch mode {
@@ -208,6 +217,15 @@ func applyReasoningOptions(chatData, data map[string]any, model string, cfg Conf
 		if enabled {
 			chatData["thinking"] = map[string]any{"type": "enabled"}
 			chatData["reasoning_effort"] = mapDeepSeekEffort(effort)
+		} else if effort != "" {
+			chatData["thinking"] = map[string]any{"type": "disabled"}
+		}
+	case ReasoningThinkingOnly:
+		// Only emit the `thinking` object; never a top-level reasoning_effort.
+		// Real GLM / Kimi / MiMo upstreams reject reasoning_effort but read
+		// thinking.type to gate reasoning on/off.
+		if enabled {
+			chatData["thinking"] = map[string]any{"type": "enabled"}
 		} else if effort != "" {
 			chatData["thinking"] = map[string]any{"type": "disabled"}
 		}
@@ -230,8 +248,46 @@ func applyReasoningOptions(chatData, data map[string]any, model string, cfg Conf
 	}
 }
 
+// inferReasoningMode maps model/baseURL to the upstream reasoning parameter
+// form (top-level reasoning_effort, nested reasoning.effort object,
+// enable_thinking, reasoning_split, thinking_only). Returns
+// ReasoningPassthrough when no compatibility signal is detected, in which case
+// applyReasoningOptions leaves reasoning untouched and forwards no reasoning
+// field upstream.
+//
+// The vendor/platform set mirrors cc-switch's
+// infer_codex_chat_reasoning_config (codex.rs): platform detection via URL is
+// preferred over model name since aggregator platforms may proxy vendor model
+// names that no longer reveal the platform's own reasoning contract.
+func inferReasoningMode(model, baseURL string) ReasoningMode {
+	platform := strings.ToLower(baseURL + " " + model)
+	switch {
+	case strings.Contains(platform, "openrouter"):
+		return ReasoningEffortObj
+	case strings.Contains(platform, "siliconflow"):
+		return ReasoningEnableThinking
+	}
+
+	mLower := strings.ToLower(model)
+	switch {
+	case strings.Contains(mLower, "glm") || strings.Contains(mLower, "zhipu") || strings.Contains(mLower, "z.ai") ||
+		strings.Contains(mLower, "kimi") || strings.Contains(mLower, "moonshot") ||
+		strings.Contains(mLower, "mimo"):
+		return ReasoningThinkingOnly
+	case strings.Contains(mLower, "qwen") || strings.Contains(mLower, "dashscope") || strings.Contains(mLower, "bailian"):
+		return ReasoningEnableThinking
+	case strings.Contains(mLower, "minimax"):
+		return ReasoningSplit
+	case strings.Contains(mLower, "deepseek"):
+		return ReasoningThinking
+	case isOSeriesModel(model) || supportsReasoningEffort(model):
+		return ReasoningEffort
+	}
+	return ReasoningPassthrough
+}
+
 // ===========================================================================
-// ConvertResponse — chat completions → responses
+// ConvertResponse --chat completions --responses
 // ===========================================================================
 
 func ConvertResponse(chatResp, originalReq map[string]any) map[string]any {
@@ -1146,7 +1202,7 @@ func NormalizeUpstreamError(body map[string]any) map[string]any {
 }
 
 // ===========================================================================
-// StreamingConverter — chat SSE → responses SSE
+// StreamingConverter --chat SSE --responses SSE
 // ===========================================================================
 
 type StreamingConverter struct {

@@ -281,3 +281,89 @@ func assertContains(t *testing.T, haystack, needle string) {
 func contains(haystack, needle string) bool {
 	return len(needle) == 0 || (len(haystack) >= len(needle) && (haystack == needle || contains(haystack[1:], needle) || (len(haystack) >= len(needle) && haystack[:len(needle)] == needle)))
 }
+
+func TestInferReasoningMode(t *testing.T) {
+	cases := []struct {
+		model, baseURL string
+		want           ReasoningMode
+	}{
+		{"gpt-5.1", "https://api.openai.com/v1", ReasoningEffort},
+		{"o3-mini", "https://api.openai.com/v1", ReasoningEffort},
+		{"deepseek-v4-pro", "https://api.deepseek.com/v1", ReasoningThinking},
+		{"glm-5.2", "https://open.bigmodel.cn/api/v1", ReasoningThinkingOnly},
+		{"kimi-k2", "https://api.moonshot.cn/v1", ReasoningThinkingOnly},
+		{"qwen-max", "https://dashscope.aliyuncs.com/api/v1", ReasoningEnableThinking},
+		{"MiniMax-M2.7", "https://api.minimaxi.com/v1", ReasoningSplit},
+		{"glm-5.2", "https://openrouter.ai/api/v1", ReasoningEffortObj},
+		{"some-custom-model", "https://my-third-party-proxy/v1", ReasoningPassthrough},
+	}
+	for _, tc := range cases {
+		got := inferReasoningMode(tc.model, tc.baseURL)
+		if got != tc.want {
+			t.Errorf("inferReasoningMode(%q, %q) = %q, want %q", tc.model, tc.baseURL, got, tc.want)
+		}
+	}
+}
+
+func TestConvertRequestExplicitReasoningModeOverridesInference(t *testing.T) {
+	// glm-5.2 would infer to thinking_only, but a custom upstream declares it
+	// accepts a top-level reasoning_effort -> REASONING_MODE=effort must win.
+	converted := ConvertRequest(map[string]any{
+		"model":     "glm-5.2",
+		"input":     "hi",
+		"reasoning": map[string]any{"effort": "high"},
+	}, Config{ReasoningMode: ReasoningEffort})
+
+	if _, ok := converted["thinking"]; ok {
+		t.Fatalf("explicit effort mode should not emit thinking, got %v", converted["thinking"])
+	}
+	if converted["reasoning_effort"] != "high" {
+		t.Fatalf("expected reasoning_effort=high, got %v", converted["reasoning_effort"])
+	}
+}
+
+func TestConvertRequestGLMInferredThinkingOnly(t *testing.T) {
+	converted := ConvertRequest(map[string]any{
+		"model":     "glm-5.2",
+		"input":     "hi",
+		"reasoning": map[string]any{"effort": "high"},
+	}, Config{})
+
+	if _, ok := converted["reasoning_effort"]; ok {
+		t.Fatalf("thinking_only must not emit top-level reasoning_effort, got %v", converted["reasoning_effort"])
+	}
+	if thinking, _ := converted["thinking"].(map[string]any); thinking["type"] != "enabled" {
+		t.Fatalf("expected thinking.type=enabled, got %#v", converted["thinking"])
+	}
+}
+
+func TestConvertRequestOpenRouterInferredEffortObj(t *testing.T) {
+	converted := ConvertRequest(map[string]any{
+		"model":     "glm-5.2",
+		"input":     "hi",
+		"reasoning": map[string]any{"effort": "xhigh"},
+	}, Config{UpstreamBaseURL: "https://openrouter.ai/api/v1"})
+
+	reasoning, ok := converted["reasoning"].(map[string]any)
+	if !ok {
+		t.Fatalf("openrouter should emit reasoning.effort object, got %v", converted["reasoning"])
+	}
+	if reasoning["effort"] != "xhigh" {
+		t.Fatalf("expected reasoning.effort=xhigh, got %v", reasoning["effort"])
+	}
+}
+
+func TestConvertRequestGlmpassthroughWhenUnknown(t *testing.T) {
+	converted := ConvertRequest(map[string]any{
+		"model":     "some-unknown-model",
+		"input":     "hi",
+		"reasoning": map[string]any{"effort": "high"},
+	}, Config{UpstreamBaseURL: "https://my-proxy/v1"})
+
+	if _, ok := converted["reasoning_effort"]; ok {
+		t.Fatalf("passthrough should not emit reasoning_effort, got %v", converted["reasoning_effort"])
+	}
+	if _, ok := converted["thinking"]; ok {
+		t.Fatalf("passthrough should not emit thinking, got %v", converted["thinking"])
+	}
+}

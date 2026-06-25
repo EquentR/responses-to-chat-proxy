@@ -6,7 +6,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// Cache Injector — mirrors cc-switch cache_injector.rs
+// Cache Injector -- mirrors cc-switch cache_injector.rs
 // ---------------------------------------------------------------------------
 
 // InjectCacheBreakpoints injects cache_control breakpoints at strategic
@@ -17,13 +17,13 @@ import (
 //  1. Last tool definition
 //  2. Last system message content block
 //  3. Last assistant message's last non-thinking content block
-//  4. (inherited from existing breakpoints — up to 4 total)
+//  4. (inherited from existing breakpoints -- up to 4 total)
 //
 // The function mutates body in place and returns the number of new breakpoints injected.
 func InjectCacheBreakpoints(body map[string]any, ttl string) int {
 	existing := countExistingBreakpoints(body)
 	if existing >= 4 {
-		// Already at max capacity — just upgrade TTLs.
+		// Already at max capacity -- just upgrade TTLs.
 		upgradeExistingTTL(body, ttl)
 		return 0
 	}
@@ -180,7 +180,7 @@ func makeCacheControl(ttl string) map[string]any {
 }
 
 // ---------------------------------------------------------------------------
-// Thinking Rectifier — mirrors cc-switch thinking_rectifier.rs
+// Thinking Rectifier -- mirrors cc-switch thinking_rectifier.rs
 // ---------------------------------------------------------------------------
 
 // ShouldRectifyThinkingSignature checks whether an upstream error message
