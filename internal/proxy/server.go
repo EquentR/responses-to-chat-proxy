@@ -111,10 +111,6 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) forwardUnknownV1(w http.ResponseWriter, r *http.Request) {
-	if !s.authorize(w, r) {
-		return
-	}
-
 	upstreamURL := s.config.UpstreamBaseURL + strings.TrimPrefix(r.URL.Path, "/v1")
 	if rawQuery := r.URL.RawQuery; rawQuery != "" {
 		upstreamURL += "?" + rawQuery

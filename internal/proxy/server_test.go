@@ -168,3 +168,27 @@ func TestProxyAuthorization(t *testing.T) {
 	}
 	assertContains(t, recorder.Body.String(), `"code":"invalid_api_key"`)
 }
+
+func TestForwardUnknownV1SkipsProxyAuth(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": []any{map[string]any{"id": "m1"}}})
+	}))
+	defer upstream.Close()
+
+	server := NewServer(Config{
+		UpstreamBaseURL: upstream.URL + "/v1",
+		ProxyAPIKey:     "proxy-secret",
+		RequestTimeout:  secondsToDuration(5),
+		StreamTimeout:   secondsToDuration(5),
+		VerifySSL:       true,
+	})
+
+	request := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200 but got %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	assertContains(t, recorder.Body.String(), `"id":"m1"`)
+}
