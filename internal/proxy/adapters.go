@@ -57,7 +57,8 @@ func (p *messageTextParts) collectReasoning(value any) {
 	case nil:
 		return
 	case string:
-		if reasoning, _ := splitThinkTag(typed); reasoning != "" {
+		reasoning, _, found := splitThinkText(typed)
+		if found {
 			p.addReasoning(reasoning)
 			return
 		}
@@ -98,10 +99,8 @@ func (p *messageTextParts) collectReasoningMap(value map[string]any) {
 		p.collectReasoning(value["thinking"])
 		return
 	case "summary_text", "reasoning_text":
-		p.addReasoning(stringValue(value["text"]))
-		if extra := stringValue(value["content"]); extra != "" {
-			p.addReasoning(extra)
-		}
+		p.collectReasoning(value["text"])
+		p.collectReasoning(value["content"])
 		return
 	case "reasoning":
 		p.collectReasoning(value["summary"])
@@ -121,8 +120,8 @@ func (p *messageTextParts) collectReasoningMap(value map[string]any) {
 	}
 
 	for _, key := range []string{"thinking", "text", "data", "reasoning"} {
-		if text := stringValue(value[key]); text != "" {
-			p.addReasoning(text)
+		if child, ok := value[key]; ok {
+			p.collectReasoning(child)
 		}
 	}
 }
@@ -132,13 +131,13 @@ func (p *messageTextParts) collectVisible(value any) {
 	case nil:
 		return
 	case string:
-		reasoning, visible := splitThinkTag(typed)
-		if reasoning != "" {
+		reasoning, visible, found := splitThinkText(typed)
+		if found {
 			p.addReasoning(reasoning)
-		}
-		if visible != "" || reasoning == "" {
 			p.addVisible(visible)
+			return
 		}
+		p.addVisible(typed)
 	case []string:
 		for _, item := range typed {
 			p.addVisible(item)
@@ -558,22 +557,130 @@ func finalizeOutputItems(output []any, responseStatus string) []any {
 	return output
 }
 
+type thinkTextAccumulator struct {
+	insideThink   bool
+	expectedClose string
+	carry         string
+	foundTag      bool
+}
+
+var thinkOpenTags = []string{"<think>", "<thinking>"}
+
+func splitThinkText(text string) (reasoning, visible string, found bool) {
+	var acc thinkTextAccumulator
+	reasoning, visible = acc.consume(text)
+	reasoning2, visible2 := acc.finish()
+	return reasoning + reasoning2, visible + visible2, acc.foundTag
+}
+
 func splitThinkTag(content string) (reasoning, visible string) {
-	for _, tag := range []string{"<think>", "<thinking>"} {
-		after, found := strings.CutPrefix(content, tag)
-		if !found {
+	reasoning, visible, _ = splitThinkText(content)
+	return reasoning, visible
+}
+
+func (a *thinkTextAccumulator) consume(text string) (reasoning, visible string) {
+	buf := a.carry + text
+	a.carry = ""
+	var reasoningParts, visibleParts strings.Builder
+
+	for len(buf) > 0 {
+		if !a.insideThink {
+			idx, tag := findThinkTag(buf, thinkOpenTags)
+			if idx >= 0 {
+				if idx > 0 {
+					visibleParts.WriteString(buf[:idx])
+				}
+				buf = buf[idx+len(tag):]
+				a.insideThink = true
+				a.expectedClose = matchingThinkCloseTag(tag)
+				a.foundTag = true
+				continue
+			}
+
+			keep := longestThinkPrefixSuffix(buf, thinkOpenTags)
+			if keep > 0 {
+				if len(buf) > keep {
+					visibleParts.WriteString(buf[:len(buf)-keep])
+				}
+				a.carry = buf[len(buf)-keep:]
+			} else {
+				visibleParts.WriteString(buf)
+			}
+			break
+		}
+
+		idx, _ := findThinkTag(buf, []string{a.expectedClose})
+		if idx >= 0 {
+			if idx > 0 {
+				reasoningParts.WriteString(buf[:idx])
+			}
+			buf = buf[idx+len(a.expectedClose):]
+			a.insideThink = false
+			a.expectedClose = ""
+			a.foundTag = true
 			continue
 		}
-		closeTag := strings.Replace(tag, "<", "</", 1)
-		reason, rest, foundClose := strings.Cut(after, closeTag)
-		if foundClose {
-			rest = strings.TrimSpace(rest)
-			rest = strings.TrimPrefix(rest, "\n")
-			return strings.TrimSpace(reason), rest
+
+		keep := longestThinkPrefixSuffix(buf, []string{a.expectedClose})
+		if keep > 0 {
+			if len(buf) > keep {
+				reasoningParts.WriteString(buf[:len(buf)-keep])
+			}
+			a.carry = buf[len(buf)-keep:]
+		} else {
+			reasoningParts.WriteString(buf)
 		}
-		return strings.TrimSpace(after), ""
+		break
 	}
-	return "", content
+
+	return reasoningParts.String(), visibleParts.String()
+}
+
+func (a *thinkTextAccumulator) finish() (reasoning, visible string) {
+	if a.carry == "" {
+		return "", ""
+	}
+	if a.insideThink {
+		reasoning = a.carry
+	} else {
+		visible = a.carry
+	}
+	a.carry = ""
+	return reasoning, visible
+}
+
+func findThinkTag(text string, tags []string) (index int, tag string) {
+	index = -1
+	for _, candidate := range tags {
+		if i := strings.Index(text, candidate); i >= 0 {
+			if index < 0 || i < index || (i == index && len(candidate) > len(tag)) {
+				index = i
+				tag = candidate
+			}
+		}
+	}
+	return index, tag
+}
+
+func matchingThinkCloseTag(openTag string) string {
+	switch openTag {
+	case "<thinking>":
+		return "</thinking>"
+	default:
+		return "</think>"
+	}
+}
+
+func longestThinkPrefixSuffix(text string, tags []string) int {
+	maxKeep := 0
+	for _, tag := range tags {
+		for keep := 1; keep < len(tag) && keep <= len(text); keep++ {
+			if strings.HasSuffix(text, tag[:keep]) && keep > maxKeep {
+				maxKeep = keep
+			}
+		}
+	}
+	return maxKeep
 }
 
 func estimateReasoningTokens(text string) int {
@@ -1124,7 +1231,7 @@ func buildOutputItem(message map[string]any, responseID, finishReason string, tc
 			if isReasoningContentPartType(pt) {
 				continue
 			}
-			converted := convertOutputPartWithoutThinking(part, messageText)
+			converted := convertOutputPartWithoutThinking(part)
 			if converted != nil {
 				textContent = append(textContent, converted)
 			}
@@ -1135,17 +1242,30 @@ func buildOutputItem(message map[string]any, responseID, finishReason string, tc
 	return outputItem
 }
 
-func convertOutputPartWithoutThinking(part map[string]any, messageText string) map[string]any {
-	if stringValue(part["type"]) == "text" {
-		_, visible := splitThinkTag(stringValue(part["text"]))
-		if visible == "" {
-			return nil
+func convertOutputPartWithoutThinking(part map[string]any) map[string]any {
+	switch stringValue(part["type"]) {
+	case "text", "output_text":
+		_, visible, found := splitThinkText(stringValue(part["text"]))
+		if found {
+			if visible == "" {
+				return nil
+			}
+			return map[string]any{
+				"type": "output_text", "text": visible, "annotations": []any{},
+			}
 		}
-		return map[string]any{
-			"type": "output_text", "text": visible, "annotations": []any{},
+		if stringValue(part["type"]) == "text" {
+			if visible == "" {
+				return nil
+			}
+			return map[string]any{
+				"type": "output_text", "text": visible, "annotations": []any{},
+			}
 		}
+		return part
+	default:
+		return part
 	}
-	return part
 }
 
 func isReasoningContentPartType(partType string) bool {
@@ -1162,17 +1282,17 @@ func buildToolOutputItems(message map[string]any, responseID string, tc *toolCon
 	suffix = strings.TrimPrefix(suffix, "resp_")
 	toolCalls, _ := message["tool_calls"].([]any)
 	var items []any
-	for _, raw := range toolCalls {
+	for index, raw := range toolCalls {
 		tcMap, ok := raw.(map[string]any)
 		if !ok {
 			continue
 		}
-		items = append(items, restoreToolCall(tcMap, suffix, tc))
+		items = append(items, restoreToolCall(tcMap, suffix, index, tc))
 	}
 	return items
 }
 
-func restoreToolCall(toolCall map[string]any, suffix string, tc *toolContext) map[string]any {
+func restoreToolCall(toolCall map[string]any, suffix string, index int, tc *toolContext) map[string]any {
 	fn, _ := toolCall["function"].(map[string]any)
 	chatName := stringValue(fn["name"])
 	callID := stringValue(toolCall["id"])
@@ -1180,9 +1300,13 @@ func restoreToolCall(toolCall map[string]any, suffix string, tc *toolContext) ma
 
 	spec := tc.chatNameToSpec[chatName]
 	if spec == nil {
+		id := toolCallFallbackID("fc_", suffix, index)
+		if callID != "" {
+			id = "fc_" + strings.TrimPrefix(callID, "call_")
+		}
 		return map[string]any{
 			"type":      "function_call",
-			"id":        "fc_" + strings.TrimPrefix(callID, "call_"),
+			"id":        id,
 			"call_id":   callID,
 			"status":    "completed",
 			"name":      chatName,
@@ -1192,9 +1316,13 @@ func restoreToolCall(toolCall map[string]any, suffix string, tc *toolContext) ma
 
 	switch spec.kind {
 	case "namespace":
+		id := toolCallFallbackID("fc_", suffix, index)
+		if callID != "" {
+			id = "fc_" + strings.TrimPrefix(callID, "call_")
+		}
 		return map[string]any{
 			"type":      "function_call",
-			"id":        "fc_" + strings.TrimPrefix(callID, "call_"),
+			"id":        id,
 			"call_id":   callID,
 			"status":    "completed",
 			"namespace": spec.namespace,
@@ -1202,28 +1330,40 @@ func restoreToolCall(toolCall map[string]any, suffix string, tc *toolContext) ma
 			"arguments": args,
 		}
 	case "custom":
+		id := toolCallFallbackID("ctc_", suffix, index)
+		if callID != "" {
+			id = "ctc_" + strings.TrimPrefix(callID, "call_")
+		}
 		input := extractCustomToolInput(args)
 		return map[string]any{
 			"type":    "custom_tool_call",
-			"id":      "ctc_" + strings.TrimPrefix(callID, "call_"),
+			"id":      id,
 			"call_id": callID,
 			"status":  "completed",
 			"name":    spec.name,
 			"input":   input,
 		}
 	case "tool_search":
+		id := toolCallFallbackID("tsc_", suffix, index)
+		if callID != "" {
+			id = "tsc_" + strings.TrimPrefix(callID, "call_")
+		}
 		return map[string]any{
 			"type":      "tool_search_call",
-			"id":        "tsc_" + strings.TrimPrefix(callID, "call_"),
+			"id":        id,
 			"call_id":   callID,
 			"status":    "completed",
 			"arguments": parseJSONObject(args),
 			"execution": "client",
 		}
 	default:
+		id := toolCallFallbackID("fc_", suffix, index)
+		if callID != "" {
+			id = "fc_" + strings.TrimPrefix(callID, "call_")
+		}
 		return map[string]any{
 			"type":      "function_call",
-			"id":        "fc_" + strings.TrimPrefix(callID, "call_"),
+			"id":        id,
 			"call_id":   callID,
 			"status":    "completed",
 			"name":      spec.name,
@@ -1578,6 +1718,7 @@ type StreamingConverter struct {
 	messageRole          string
 	fullText             string
 	reasoningText        string
+	contentThink         thinkTextAccumulator
 	finishReason         string
 	toolCalls            map[int]*streamToolCall
 	sseBuffer            string
@@ -1714,19 +1855,12 @@ func (c *StreamingConverter) processChunk(data map[string]any) []string {
 
 	// visible content delta
 	if content := stringValue(delta["content"]); content != "" {
-		visible := content
-		if thinkR, visibleText := splitThinkTag(content); thinkR != "" {
-			visible = visibleText
-			events = append(events, c.appendReasoningDelta(thinkR)...)
+		reasoning, visible := c.contentThink.consume(content)
+		if reasoning != "" {
+			events = append(events, c.appendReasoningDelta(reasoning)...)
 		}
 		if visible != "" {
-			events = append(events, c.ensureContentPart()...)
-			c.fullText += visible
-			c.sawSubstantiveOutput = true
-			events = append(events, sseEvent("response.output_text.delta", map[string]any{
-				"item_id": c.messageID, "output_index": c.messageOutputIndexValue(),
-				"content_index": 0, "delta": visible,
-			}))
+			events = append(events, c.appendVisibleDelta(visible)...)
 		}
 	}
 
@@ -1782,6 +1916,32 @@ func (c *StreamingConverter) appendReasoningDelta(delta string) []string {
 		"item_id": c.reasoningItemID(), "output_index": c.reasoningOutputIndexValue(),
 		"content_index": 0, "delta": delta,
 	}))
+	return events
+}
+
+func (c *StreamingConverter) appendVisibleDelta(delta string) []string {
+	if delta == "" {
+		return nil
+	}
+	c.fullText += delta
+	c.sawSubstantiveOutput = true
+	events := c.ensureContentPart()
+	events = append(events, sseEvent("response.output_text.delta", map[string]any{
+		"item_id": c.messageID, "output_index": c.messageOutputIndexValue(),
+		"content_index": 0, "delta": delta,
+	}))
+	return events
+}
+
+func (c *StreamingConverter) flushThinkContent() []string {
+	reasoning, visible := c.contentThink.finish()
+	var events []string
+	if reasoning != "" {
+		events = append(events, c.appendReasoningDelta(reasoning)...)
+	}
+	if visible != "" {
+		events = append(events, c.appendVisibleDelta(visible)...)
+	}
 	return events
 }
 
@@ -1934,6 +2094,7 @@ func (c *StreamingConverter) finishOutputItems() []string {
 	var events []string
 	if !c.outputItemDone {
 		c.outputItemDone = true
+		events = append(events, c.flushThinkContent()...)
 		events = append(events, c.finishReasoningEvents()...)
 		events = append(events, c.finishTextEvents()...)
 		if c.outputItemAdded {
@@ -2120,6 +2281,13 @@ func responseSuffix(responseID string) string {
 		return "unknown"
 	}
 	return suffix
+}
+
+func toolCallFallbackID(prefix, suffix string, index int) string {
+	if suffix == "" {
+		suffix = "unknown"
+	}
+	return fmt.Sprintf("%s%s_%d", prefix, suffix, index)
 }
 
 func (c *StreamingConverter) toolItemIDForSpec(spec normalizedStreamToolCall, callID string, index int) string {

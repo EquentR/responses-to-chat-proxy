@@ -473,6 +473,49 @@ func TestConvertResponseReasoningContentPartDoesNotPolluteVisibleMessage(t *test
 	}
 }
 
+func TestConvertResponseStripsEmbeddedThinkBlocksFromTextAndOutputTextParts(t *testing.T) {
+	converted := ConvertResponse(map[string]any{
+		"id":      "chatcmpl-abc",
+		"created": 123,
+		"model":   "test-model",
+		"choices": []any{
+			map[string]any{
+				"finish_reason": "stop",
+				"message": map[string]any{
+					"role": "assistant",
+					"content": []any{
+						map[string]any{"type": "text", "text": "before<think>hidden</think>after"},
+						map[string]any{"type": "output_text", "text": "  <thinking>ghost</thinking>visible"},
+					},
+				},
+			},
+		},
+	}, map[string]any{"model": "test-model", "input": "Hello"})
+
+	output := converted["output"].([]any)
+	if len(output) != 2 {
+		t.Fatalf("unexpected output length: %#v", output)
+	}
+
+	reasoning := output[0].(map[string]any)
+	summary := reasoning["summary"].([]any)
+	if got := summary[0].(map[string]any)["text"]; got != "hidden\nghost" {
+		t.Fatalf("unexpected reasoning summary: %v", got)
+	}
+
+	message := output[1].(map[string]any)
+	content := message["content"].([]any)
+	if len(content) != 2 {
+		t.Fatalf("unexpected content length: %#v", content)
+	}
+	if got := content[0].(map[string]any)["text"]; got != "beforeafter" {
+		t.Fatalf("unexpected visible text from text part: %v", got)
+	}
+	if got := content[1].(map[string]any)["text"]; got != "  visible" {
+		t.Fatalf("unexpected visible text from output_text part: %v", got)
+	}
+}
+
 func TestConvertResponseThinkOnlyContentStaysInvisible(t *testing.T) {
 	stringCase := ConvertResponse(map[string]any{
 		"id":      "chatcmpl-abc",
@@ -636,6 +679,104 @@ func TestStreamingConverterReasoningUsesResponseSuffixAndOutputIndex(t *testing.
 		if payload["type"] == "response.output_text.delta" && payload["delta"] == "" {
 			t.Fatalf("unexpected empty visible delta: %#v", payload)
 		}
+	}
+}
+
+func TestStreamingConverterStripsSplitThinkBlocksAcrossChunks(t *testing.T) {
+	converter := NewStreamingConverter()
+	first := ssePayloads(converter.Feed([]byte("data: " + mustJSON(map[string]any{
+		"id":      "chatcmpl-abc",
+		"created": 123,
+		"model":   "test-model",
+		"choices": []any{
+			map[string]any{
+				"delta":         map[string]any{"role": "assistant", "content": "before<think>hidden"},
+				"finish_reason": nil,
+			},
+		},
+	}) + "\n\n")))
+	second := ssePayloads(converter.Feed([]byte("data: " + mustJSON(map[string]any{
+		"id":      "chatcmpl-abc",
+		"created": 123,
+		"model":   "test-model",
+		"choices": []any{
+			map[string]any{
+				"delta":         map[string]any{"content": "</think>after"},
+				"finish_reason": "stop",
+			},
+		},
+	}) + "\n\n")))
+
+	payloads := append(first, second...)
+	completed := findPayload(payloads, "response.completed")
+	if completed == nil {
+		t.Fatalf("missing response.completed payloads=%#v", payloads)
+	}
+
+	response := completed["response"].(map[string]any)
+	output := response["output"].([]any)
+	if len(output) != 2 {
+		t.Fatalf("unexpected output count: %#v", output)
+	}
+
+	reasoning := output[0].(map[string]any)
+	summary := reasoning["summary"].([]any)
+	if got := summary[0].(map[string]any)["text"]; got != "hidden" {
+		t.Fatalf("unexpected reasoning summary: %v", got)
+	}
+
+	message := output[1].(map[string]any)
+	content := message["content"].([]any)
+	if got := content[0].(map[string]any)["text"]; got != "beforeafter" {
+		t.Fatalf("unexpected visible text: %v", got)
+	}
+}
+
+func TestConvertResponseRestoresToolCallIDsFromResponseSuffixAndIndex(t *testing.T) {
+	converted := ConvertResponse(map[string]any{
+		"id":      "chatcmpl-abc",
+		"created": 123,
+		"model":   "test-model",
+		"choices": []any{
+			map[string]any{
+				"finish_reason": "tool_calls",
+				"message": map[string]any{
+					"role": "assistant",
+					"tool_calls": []any{
+						map[string]any{
+							"index": 0,
+							"type":  "function",
+							"function": map[string]any{
+								"name":      "shell",
+								"arguments": `{"command":"ls"}`,
+							},
+						},
+						map[string]any{
+							"index": 1,
+							"type":  "function",
+							"function": map[string]any{
+								"name":      "shell",
+								"arguments": `{"command":"pwd"}`,
+							},
+						},
+					},
+				},
+			},
+		},
+	}, map[string]any{"model": "test-model", "input": "Hello"})
+
+	output := converted["output"].([]any)
+	if len(output) != 3 {
+		t.Fatalf("unexpected output length: %#v", output)
+	}
+
+	firstTool := output[1].(map[string]any)
+	secondTool := output[2].(map[string]any)
+	if got := firstTool["id"]; got != "fc_abc_0" {
+		t.Fatalf("unexpected first fallback id: %v", got)
+	}
+	if got := secondTool["id"]; got != "fc_abc_1" {
+		t.Fatalf("unexpected second fallback id: %v", got)
 	}
 }
 
