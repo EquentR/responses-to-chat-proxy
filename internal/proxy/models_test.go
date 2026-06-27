@@ -109,6 +109,18 @@ func TestModelsDiscoveryParsesCommonMetadataShapes(t *testing.T) {
 	}
 }
 
+func TestParseModelDiscoveryResultsRejectsUnrecognizedJSON(t *testing.T) {
+	t.Parallel()
+
+	_, err := ParseModelDiscoveryResults([]byte(`{"error":{"message":"contract drift"}}`))
+	if err == nil {
+		t.Fatal("expected unrecognized models payload to fail")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "unrecognized") {
+		t.Fatalf("expected unrecognized payload error, got %q", err.Error())
+	}
+}
+
 func TestModelsDiscoveryFallsBackAcrossCandidates(t *testing.T) {
 	t.Parallel()
 
@@ -172,6 +184,47 @@ func TestModelsDiscoveryFallsBackAcrossCandidates(t *testing.T) {
 	}
 	if got.Endpoint != "/v1/responses" {
 		t.Fatalf("unexpected stored endpoint: %q", got.Endpoint)
+	}
+}
+
+func TestModelsDiscoveryFailsClosedOnUnrecognizedJSON(t *testing.T) {
+	t.Parallel()
+
+	var requests []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests = append(requests, r.URL.Path)
+
+		switch r.URL.Path {
+		case "/v1/models":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"error":{"message":"contract drift"}}`))
+		case "/models":
+			t.Fatal("discovery should not continue after an unrecognized models payload")
+		default:
+			t.Fatalf("unexpected candidate path: %s", r.URL.Path)
+		}
+	}))
+	defer upstream.Close()
+
+	cfg := Config{
+		UpstreamBaseURL:   upstream.URL,
+		UpstreamAPIKey:    "upstream-secret",
+		UpstreamModelsURL: "",
+		RequestTimeout:    secondsToDuration(5),
+		StreamTimeout:     secondsToDuration(5),
+		VerifySSL:         true,
+	}
+
+	_, err := DiscoverModels(context.Background(), &http.Client{Timeout: 5 * time.Second}, cfg)
+	if err == nil {
+		t.Fatal("expected discovery to fail")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "unrecognized") {
+		t.Fatalf("expected unrecognized payload error, got %q", err.Error())
+	}
+	if got := strings.Join(requests, " -> "); got != "/v1/models" {
+		t.Fatalf("unexpected candidate order: %s", got)
 	}
 }
 

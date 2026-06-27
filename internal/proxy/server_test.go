@@ -193,6 +193,56 @@ func TestForwardUnknownV1SkipsProxyAuth(t *testing.T) {
 	assertContains(t, recorder.Body.String(), `"id":"m1"`)
 }
 
+func TestModelsEndpointDoesNotRefreshRouteSnapshotWithoutProxyAuth(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data": []any{
+				map[string]any{
+					"id":                  "public-model",
+					"supported_endpoints": []any{"responses"},
+				},
+			},
+		})
+	}))
+	defer upstream.Close()
+
+	server := NewServer(Config{
+		UpstreamBaseURL: upstream.URL + "/v1",
+		ProxyAPIKey:     "proxy-secret",
+		UpstreamAPIKey:  "upstream-secret",
+		RequestTimeout:  secondsToDuration(5),
+		StreamTimeout:   secondsToDuration(5),
+		VerifySSL:       true,
+	})
+
+	identity := RouteIdentityKey(server.config.UpstreamBaseURL, server.config.UpstreamAPIKey)
+	server.routeTable.Store(identity, "legacy-model", RouteEntry{
+		ModelID:    "legacy-model",
+		Protocol:   RouteProtocolChat,
+		Endpoint:   "/v1/chat/completions",
+		Confidence: RouteConfidenceExplicit,
+	})
+
+	request := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	assertContains(t, recorder.Body.String(), `"id":"public-model"`)
+
+	if _, ok := server.routeTable.Resolve(identity, "legacy-model"); !ok {
+		t.Fatal("expected route snapshot to remain unchanged for unauthorized request")
+	}
+	if _, ok := server.routeTable.Resolve(identity, "public-model"); ok {
+		t.Fatal("expected unauthorized request to skip shared route refresh")
+	}
+}
+
 func TestChatCompletionsStreamSynthesizesFinishReasonOnEOF(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")

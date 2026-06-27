@@ -14,6 +14,8 @@ import (
 
 const maxModelsResponseBytes = 4 << 20
 
+var errUnrecognizedModelsCatalog = errors.New("models discovery returned an unrecognized models payload")
+
 type ModelDiscoveryResult struct {
 	ModelID            string
 	Protocol           RouteProtocol
@@ -44,13 +46,20 @@ func ParseModelDiscoveryResults(raw []byte) ([]ModelDiscoveryResult, error) {
 		return nil, fmt.Errorf("models discovery returned invalid JSON: %w", err)
 	}
 
-	items := extractModelItems(payload)
+	items, recognized := extractModelItems(payload)
+	if !recognized {
+		return nil, errUnrecognizedModelsCatalog
+	}
+
 	results := make([]ModelDiscoveryResult, 0, len(items))
 	for _, item := range items {
 		result, ok := normalizeModelDiscoveryItem(item)
 		if ok {
 			results = append(results, result)
 		}
+	}
+	if len(items) > 0 && len(results) == 0 {
+		return nil, errUnrecognizedModelsCatalog
 	}
 	return results, nil
 }
@@ -138,6 +147,9 @@ func discoverModelSelection(ctx context.Context, client *http.Client, cfg Config
 
 		results, parseErr := ParseModelDiscoveryResults(page.Body)
 		if parseErr != nil {
+			if errors.Is(parseErr, errUnrecognizedModelsCatalog) {
+				return modelDiscoverySelection{}, parseErr
+			}
 			lastParseErr = parseErr
 			continue
 		}
@@ -204,7 +216,9 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ApplyDiscoveredModels(s.routeTable, RouteIdentityKey(s.config.UpstreamBaseURL, s.config.UpstreamAPIKey), selection.Results)
+	if s.canRefreshRouteSnapshot(r) {
+		ApplyDiscoveredModels(s.routeTable, RouteIdentityKey(s.config.UpstreamBaseURL, s.config.UpstreamAPIKey), selection.Results)
+	}
 
 	contentType := selection.Page.ContentType
 	if contentType == "" {
@@ -238,26 +252,38 @@ func modelDiscoveryCandidates(baseURL, explicitModelsURL string) []string {
 	return candidates
 }
 
-func extractModelItems(payload any) []map[string]any {
+func extractModelItems(payload any) ([]map[string]any, bool) {
 	switch typed := payload.(type) {
 	case []any:
-		return mapsFromSlice(typed)
+		return extractModelItemsFromSlice(typed)
 	case map[string]any:
 		for _, key := range []string{"data", "models", "items", "results", "result"} {
 			switch values := typed[key].(type) {
 			case []any:
-				return mapsFromSlice(values)
+				return extractModelItemsFromSlice(values)
 			case map[string]any:
 				if looksLikeModelMetadata(values) {
-					return []map[string]any{values}
+					return []map[string]any{values}, true
 				}
 			}
 		}
 		if looksLikeModelMetadata(typed) {
-			return []map[string]any{typed}
+			return []map[string]any{typed}, true
 		}
 	}
-	return nil
+	return nil, false
+}
+
+func extractModelItemsFromSlice(values []any) ([]map[string]any, bool) {
+	if len(values) == 0 {
+		return nil, true
+	}
+
+	items := mapsFromSlice(values)
+	if len(items) == 0 {
+		return nil, false
+	}
+	return items, true
 }
 
 func normalizeModelDiscoveryItem(raw map[string]any) (ModelDiscoveryResult, bool) {

@@ -399,14 +399,18 @@ func (s *Server) passthroughStream(w http.ResponseWriter, r *http.Request, body 
 }
 
 func (s *Server) authorize(w http.ResponseWriter, r *http.Request) bool {
-	if s.config.ProxyAPIKey == "" {
-		return true
-	}
-	if r.Header.Get("Authorization") == "Bearer "+s.config.ProxyAPIKey {
+	if s.canRefreshRouteSnapshot(r) {
 		return true
 	}
 	writeJSON(w, http.StatusUnauthorized, errorPayload("Incorrect API key provided.", "authentication_error", "invalid_api_key"))
 	return false
+}
+
+func (s *Server) canRefreshRouteSnapshot(r *http.Request) bool {
+	if s.config.ProxyAPIKey == "" {
+		return true
+	}
+	return r.Header.Get("Authorization") == "Bearer "+s.config.ProxyAPIKey
 }
 
 func (s *Server) doRequest(ctx context.Context, client *http.Client, method, url string, headers http.Header, body io.Reader) (*http.Response, error) {
