@@ -10,6 +10,39 @@ import (
 	"testing"
 )
 
+type flushRecorder struct {
+	*httptest.ResponseRecorder
+	flushes int
+}
+
+func (r *flushRecorder) Flush() {
+	r.flushes++
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+type sequentialReadCloser struct {
+	chunks [][]byte
+	index  int
+}
+
+func (r *sequentialReadCloser) Read(p []byte) (int, error) {
+	if r.index >= len(r.chunks) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.chunks[r.index])
+	r.index++
+	return n, nil
+}
+
+func (r *sequentialReadCloser) Close() error {
+	return nil
+}
+
 func newRouteAwareTestServer(upstreamBaseURL, upstreamAPIKey string) *Server {
 	return NewServer(Config{
 		UpstreamBaseURL: upstreamBaseURL,
@@ -27,6 +60,188 @@ func storeTestRoute(server *Server, model string, protocol RouteProtocol, endpoi
 		Endpoint:   endpoint,
 		Confidence: RouteConfidenceExplicit,
 	})
+}
+
+func TestPassthroughStreamRoutesRawResponsesSSEAndFlushesChunks(t *testing.T) {
+	server := newRouteAwareTestServer("https://upstream.example/v1", "upstream-secret")
+	storeTestRoute(server, "responses-model", RouteProtocolResponses, "/v1/responses")
+	server.streamClient = &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path != "/v1/responses" {
+			t.Fatalf("unexpected path: %s", req.URL.Path)
+		}
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			t.Fatalf("ReadAll request body returned error: %v", err)
+		}
+		if !strings.Contains(string(body), `"stream":true`) {
+			t.Fatalf("expected stream request body, got %s", body)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body: &sequentialReadCloser{
+				chunks: [][]byte{
+					[]byte("data: {\"type\":\"response.created\"}\n\n"),
+					[]byte("data: [DONE]\n\n"),
+				},
+			},
+		}, nil
+	})}
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"responses-model","input":"hello","stream":true}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
+
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if got := recorder.Header().Get("Content-Type"); got != "text/event-stream; charset=utf-8" {
+		t.Fatalf("unexpected content type: %s body=%s", got, recorder.Body.String())
+	}
+	if recorder.flushes != 2 {
+		t.Fatalf("expected per-chunk flushes, got %d body=%s", recorder.flushes, recorder.Body.String())
+	}
+	assertContains(t, recorder.Body.String(), "data: {\"type\":\"response.created\"}")
+	assertContains(t, recorder.Body.String(), "data: [DONE]")
+}
+
+func TestPassthroughStreamRoutesMessagesSSEAndHandlesUpstream4xx(t *testing.T) {
+	t.Run("raw stream passes through", func(t *testing.T) {
+		server := newRouteAwareTestServer("https://upstream.example/v1", "upstream-secret")
+		storeTestRoute(server, "messages-model", RouteProtocolMessages, "/v1/messages")
+		server.streamClient = &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			if req.URL.Path != "/v1/messages" {
+				t.Fatalf("unexpected path: %s", req.URL.Path)
+			}
+			body, err := io.ReadAll(req.Body)
+			if err != nil {
+				t.Fatalf("ReadAll request body returned error: %v", err)
+			}
+			if !strings.Contains(string(body), `"stream":true`) {
+				t.Fatalf("expected stream request body, got %s", body)
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body: &sequentialReadCloser{
+					chunks: [][]byte{
+						[]byte("data: {\"type\":\"message.delta\"}\n\n"),
+					},
+				},
+			}, nil
+		})}
+
+		request := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"messages-model","messages":[{"role":"user","content":"hi"}],"stream":true}`))
+		request.Header.Set("Content-Type", "application/json")
+		recorder := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
+
+		server.ServeHTTP(recorder, request)
+
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+		}
+		if got := recorder.Header().Get("Content-Type"); got != "text/event-stream; charset=utf-8" {
+			t.Fatalf("unexpected content type: %s body=%s", got, recorder.Body.String())
+		}
+		if recorder.flushes != 1 {
+			t.Fatalf("expected stream flushes, got %d body=%s", recorder.flushes, recorder.Body.String())
+		}
+		assertContains(t, recorder.Body.String(), "data: {\"type\":\"message.delta\"}")
+	})
+
+	t.Run("upstream 4xx becomes local sse error", func(t *testing.T) {
+		server := newRouteAwareTestServer("https://upstream.example/v1", "upstream-secret")
+		storeTestRoute(server, "messages-model", RouteProtocolMessages, "/v1/messages")
+		server.streamClient = &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			if req.URL.Path != "/v1/messages" {
+				t.Fatalf("unexpected path: %s", req.URL.Path)
+			}
+			body, err := io.ReadAll(req.Body)
+			if err != nil {
+				t.Fatalf("ReadAll request body returned error: %v", err)
+			}
+			if !strings.Contains(string(body), `"stream":true`) {
+				t.Fatalf("expected stream request body, got %s", body)
+			}
+			return &http.Response{
+				StatusCode: http.StatusBadRequest,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"nope"}}`)),
+			}, nil
+		})}
+
+		request := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"messages-model","messages":[{"role":"user","content":"hi"}],"stream":true}`))
+		request.Header.Set("Content-Type", "application/json")
+		recorder := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
+
+		server.ServeHTTP(recorder, request)
+
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+		}
+		if got := recorder.Header().Get("Content-Type"); got != "text/event-stream; charset=utf-8" {
+			t.Fatalf("unexpected content type: %s body=%s", got, recorder.Body.String())
+		}
+		assertContains(t, recorder.Body.String(), "event: error")
+		assertContains(t, recorder.Body.String(), "\"message\":\"nope\"")
+		assertContains(t, recorder.Body.String(), "\"code\":\"http_400\"")
+	})
+}
+
+func TestJoinUpstreamEndpoint(t *testing.T) {
+	tests := []struct {
+		name     string
+		baseURL  string
+		endpoint string
+		want     string
+	}{
+		{
+			name:     "base with version endpoint with version",
+			baseURL:  "https://upstream.example/v1",
+			endpoint: "/v1/responses",
+			want:     "https://upstream.example/v1/responses",
+		},
+		{
+			name:     "base without version endpoint with version",
+			baseURL:  "https://upstream.example",
+			endpoint: "/v1/responses",
+			want:     "https://upstream.example/v1/responses",
+		},
+		{
+			name:     "base without version endpoint without version",
+			baseURL:  "https://upstream.example",
+			endpoint: "/messages",
+			want:     "https://upstream.example/messages",
+		},
+		{
+			name:     "endpoint without leading slash",
+			baseURL:  "https://upstream.example/v1",
+			endpoint: "responses",
+			want:     "https://upstream.example/v1/responses",
+		},
+		{
+			name:     "endpoint with whitespace",
+			baseURL:  " https://upstream.example/v1/ ",
+			endpoint: "  /v1/messages  ",
+			want:     "https://upstream.example/v1/messages",
+		},
+		{
+			name:     "absolute endpoint",
+			baseURL:  "https://upstream.example/v1",
+			endpoint: "https://alt.example/v1/messages",
+			want:     "https://alt.example/v1/messages",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := joinUpstreamEndpoint(tt.baseURL, tt.endpoint); got != tt.want {
+				t.Fatalf("unexpected endpoint: got %q want %q", got, tt.want)
+			}
+		})
+	}
 }
 
 func assertJSONTextEqual(t *testing.T, wantRaw, gotRaw string) {

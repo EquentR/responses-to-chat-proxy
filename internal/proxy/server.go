@@ -436,10 +436,15 @@ func (s *Server) passthroughStream(w http.ResponseWriter, r *http.Request, body 
 		return
 	}
 	req.Header = copyHeaders(r.Header, s.config.UpstreamAPIKey)
+	if protocol != RouteProtocolChat {
+		req.Header.Set("Accept", "text/event-stream")
+	}
 
 	resp, err := s.streamClient.Do(req)
 	if err != nil {
 		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache, no-transform")
+		w.Header().Set("X-Accel-Buffering", "no")
 		w.WriteHeader(http.StatusOK)
 		writeSSEChunks(w, nil, sseError(fmt.Sprintf("Upstream request failed: %v", err), "upstream_request_failed"))
 		return
@@ -453,10 +458,7 @@ func (s *Server) passthroughStream(w http.ResponseWriter, r *http.Request, body 
 
 	flusher, _ := w.(http.Flusher)
 	if protocol != RouteProtocolChat {
-		_, _ = io.Copy(w, resp.Body)
-		if flusher != nil {
-			flusher.Flush()
-		}
+		s.passthroughRawStream(w, flusher, resp)
 		return
 	}
 
@@ -478,6 +480,31 @@ func (s *Server) passthroughStream(w http.ResponseWriter, r *http.Request, body 
 			}
 			return
 		}
+		writeSSEChunks(w, flusher, sseError(fmt.Sprintf("Upstream request failed: %v", readErr), "upstream_request_failed"))
+		return
+	}
+}
+
+func (s *Server) passthroughRawStream(w http.ResponseWriter, flusher http.Flusher, resp *http.Response) {
+	if resp.StatusCode >= http.StatusBadRequest {
+		errorData := readStreamError(resp)
+		writeSSEChunks(w, flusher, sseError(extractErrorMessage(errorData), fmt.Sprintf("http_%d", resp.StatusCode)))
+		return
+	}
+
+	buffer := make([]byte, 4096)
+	for {
+		n, readErr := resp.Body.Read(buffer)
+		if n > 0 {
+			writeSSEChunks(w, flusher, buffer[:n])
+		}
+		if readErr == nil {
+			continue
+		}
+		if errors.Is(readErr, io.EOF) {
+			return
+		}
+
 		writeSSEChunks(w, flusher, sseError(fmt.Sprintf("Upstream request failed: %v", readErr), "upstream_request_failed"))
 		return
 	}
