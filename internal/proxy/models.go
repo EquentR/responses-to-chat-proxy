@@ -150,11 +150,11 @@ func discoverModelSelection(ctx context.Context, client *http.Client, cfg Config
 		return modelDiscoverySelection{Page: page, Results: results}, nil
 	}
 
-	if lastEmptyPage != nil {
-		return modelDiscoverySelection{Page: *lastEmptyPage, Results: nil}, nil
-	}
 	if lastParseErr != nil {
 		return modelDiscoverySelection{}, lastParseErr
+	}
+	if lastEmptyPage != nil {
+		return modelDiscoverySelection{Page: *lastEmptyPage, Results: nil}, nil
 	}
 	if lastErr != nil {
 		return modelDiscoverySelection{}, lastErr

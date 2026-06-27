@@ -266,6 +266,49 @@ func TestModelsDiscoveryContinuesAfterParseError(t *testing.T) {
 	}
 }
 
+func TestModelsDiscoveryPrefersParseErrorOverLaterEmptyResult(t *testing.T) {
+	t.Parallel()
+
+	var requests []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests = append(requests, r.URL.Path)
+
+		switch r.URL.Path {
+		case "/v1/models":
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write([]byte("<html><body>broken discovery page</body></html>"))
+		case "/models":
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": []any{}})
+		default:
+			t.Fatalf("unexpected candidate path: %s", r.URL.Path)
+		}
+	}))
+	defer upstream.Close()
+
+	cfg := Config{
+		UpstreamBaseURL:   upstream.URL,
+		UpstreamAPIKey:    "upstream-secret",
+		UpstreamModelsURL: "",
+		RequestTimeout:    secondsToDuration(5),
+		StreamTimeout:     secondsToDuration(5),
+		VerifySSL:         true,
+	}
+
+	results, err := DiscoverModels(context.Background(), &http.Client{Timeout: 5 * time.Second}, cfg)
+	if err == nil {
+		t.Fatal("expected discovery to fail")
+	}
+	if !strings.Contains(err.Error(), "invalid JSON") {
+		t.Fatalf("expected parse error to win, got %q", err.Error())
+	}
+	if results != nil {
+		t.Fatalf("expected no results on error, got %#v", results)
+	}
+	if got := strings.Join(requests, " -> "); got != "/v1/models -> /models" {
+		t.Fatalf("unexpected candidate order: %s", got)
+	}
+}
+
 func TestModelsDiscoveryContinuesAfterEmptyResult(t *testing.T) {
 	t.Parallel()
 
