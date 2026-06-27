@@ -170,7 +170,7 @@ func (p *messageTextParts) collectVisible(value any) {
 			p.collectVisible(content)
 		}
 		if output := stringValue(typed["output"]); output != "" {
-			p.addVisible(output)
+			p.collectVisible(output)
 		}
 	default:
 		p.addVisible(stringValue(typed))
@@ -1254,26 +1254,33 @@ func buildOutputItem(message map[string]any, responseID, finishReason string, tc
 }
 
 func convertOutputPartWithoutThinking(part map[string]any) map[string]any {
-	switch stringValue(part["type"]) {
-	case "text", "output_text":
-		_, visible, found := splitThinkText(stringValue(part["text"]))
-		if found || stringValue(part["type"]) == "text" {
-			if visible == "" {
-				return nil
-			}
-			return map[string]any{
-				"type": "output_text", "text": visible, "annotations": []any{},
-			}
-		}
+	if visible, ok := visibleOutputText(part); ok {
 		if visible == "" {
 			return nil
 		}
 		return map[string]any{
 			"type": "output_text", "text": visible, "annotations": []any{},
 		}
-	default:
-		return part
 	}
+	return part
+}
+
+func visibleOutputText(part map[string]any) (string, bool) {
+	for _, key := range []string{"text", "content", "output"} {
+		if visible, ok := splitThinkVisibleString(part[key]); ok {
+			return visible, true
+		}
+	}
+	return "", false
+}
+
+func splitThinkVisibleString(value any) (string, bool) {
+	text := stringValue(value)
+	if text == "" {
+		return "", false
+	}
+	_, visible, _ := splitThinkText(text)
+	return visible, true
 }
 
 func isReasoningContentPartType(partType string) bool {

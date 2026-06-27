@@ -516,6 +516,52 @@ func TestConvertResponseStripsEmbeddedThinkBlocksFromTextAndOutputTextParts(t *t
 	}
 }
 
+func TestConvertResponseNormalizesGenericOutputPartsWithThinkTags(t *testing.T) {
+	converted := ConvertResponse(map[string]any{
+		"id":      "chatcmpl-abc",
+		"created": 123,
+		"model":   "test-model",
+		"choices": []any{
+			map[string]any{
+				"finish_reason": "stop",
+				"message": map[string]any{
+					"role": "assistant",
+					"content": []any{
+						map[string]any{"type": "tool_result", "output": "Visible <think>hidden</think> done"},
+					},
+				},
+			},
+		},
+	}, map[string]any{"model": "test-model", "input": "Hello"})
+
+	output := converted["output"].([]any)
+	if len(output) != 2 {
+		t.Fatalf("unexpected output length: %#v", output)
+	}
+
+	reasoning := output[0].(map[string]any)
+	summary := reasoning["summary"].([]any)
+	if got := summary[0].(map[string]any)["text"]; got != "hidden" {
+		t.Fatalf("unexpected reasoning summary: %v", got)
+	}
+
+	message := output[1].(map[string]any)
+	content := message["content"].([]any)
+	if len(content) != 1 {
+		t.Fatalf("unexpected content length: %#v", content)
+	}
+	part := content[0].(map[string]any)
+	if part["type"] != "output_text" {
+		t.Fatalf("unexpected normalized part type: %#v", part)
+	}
+	if got := part["text"]; got != "Visible done" {
+		t.Fatalf("unexpected visible text: %v", got)
+	}
+	if _, ok := part["output"]; ok {
+		t.Fatalf("normalized output part should not keep raw output field: %#v", part)
+	}
+}
+
 func TestConvertResponseNormalizesOutputTextPartsAndTrimsThinkSeparatorWhitespace(t *testing.T) {
 	tests := []struct {
 		name          string

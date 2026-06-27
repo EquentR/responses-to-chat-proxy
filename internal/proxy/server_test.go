@@ -243,6 +243,52 @@ func TestModelsEndpointDoesNotRefreshRouteSnapshotWithoutProxyAuth(t *testing.T)
 	}
 }
 
+func TestModelsEndpointKeepsLegacyRouteWhenDiscoveryReturnsOnlyEmptyCatalog(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			fallthrough
+		case "/models":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"data":[]}`))
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer upstream.Close()
+
+	server := NewServer(Config{
+		UpstreamBaseURL: upstream.URL + "/v1",
+		ProxyAPIKey:     "proxy-secret",
+		UpstreamAPIKey:  "upstream-secret",
+		RequestTimeout:  secondsToDuration(5),
+		StreamTimeout:   secondsToDuration(5),
+		VerifySSL:       true,
+	})
+
+	identity := RouteIdentityKey(server.config.UpstreamBaseURL, server.config.UpstreamAPIKey)
+	server.routeTable.Store(identity, "legacy-model", RouteEntry{
+		ModelID:    "legacy-model",
+		Protocol:   RouteProtocolChat,
+		Endpoint:   "/v1/chat/completions",
+		Confidence: RouteConfidenceExplicit,
+	})
+
+	request := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	request.Header.Set("Authorization", "Bearer proxy-secret")
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code == http.StatusOK {
+		t.Fatalf("expected discovery failure, got 200 body=%s", recorder.Body.String())
+	}
+	if _, ok := server.routeTable.Resolve(identity, "legacy-model"); !ok {
+		t.Fatal("expected legacy route to remain when discovery returns no models")
+	}
+}
+
 func TestModelsEndpointFailsClosedOnErrorPayloadWithEmptyData(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {

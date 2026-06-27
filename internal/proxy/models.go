@@ -126,7 +126,7 @@ func discoverModelSelection(ctx context.Context, client *http.Client, cfg Config
 
 	var lastErr error
 	var lastParseErr error
-	var lastEmptyPage *modelDiscoveryPage
+	var sawEmptyPage bool
 
 	for _, candidate := range candidates {
 		page, err := fetchModelDiscoveryPage(ctx, client, cfg, incoming, candidate)
@@ -154,8 +154,7 @@ func discoverModelSelection(ctx context.Context, client *http.Client, cfg Config
 			continue
 		}
 		if len(results) == 0 {
-			emptyPage := page
-			lastEmptyPage = &emptyPage
+			sawEmptyPage = true
 			continue
 		}
 
@@ -165,8 +164,8 @@ func discoverModelSelection(ctx context.Context, client *http.Client, cfg Config
 	if lastParseErr != nil {
 		return modelDiscoverySelection{}, lastParseErr
 	}
-	if lastEmptyPage != nil {
-		return modelDiscoverySelection{Page: *lastEmptyPage, Results: nil}, nil
+	if sawEmptyPage {
+		return modelDiscoverySelection{}, errors.New("models discovery returned no models from any candidate")
 	}
 	if lastErr != nil {
 		return modelDiscoverySelection{}, lastErr
