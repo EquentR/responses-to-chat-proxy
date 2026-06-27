@@ -219,6 +219,53 @@ func TestModelsDiscoveryContinuesAfter501(t *testing.T) {
 	}
 }
 
+func TestModelsDiscoveryContinuesAfterParseError(t *testing.T) {
+	t.Parallel()
+
+	var requests []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests = append(requests, r.URL.Path)
+
+		switch r.URL.Path {
+		case "/v1/models":
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write([]byte("<html><body>models page temporarily broken</body></html>"))
+		case "/models":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": []any{
+					map[string]any{
+						"id":       "fallback-parse-error-model",
+						"protocol": "responses",
+					},
+				},
+			})
+		default:
+			t.Fatalf("unexpected candidate path: %s", r.URL.Path)
+		}
+	}))
+	defer upstream.Close()
+
+	cfg := Config{
+		UpstreamBaseURL:   upstream.URL,
+		UpstreamAPIKey:    "upstream-secret",
+		UpstreamModelsURL: "",
+		RequestTimeout:    secondsToDuration(5),
+		StreamTimeout:     secondsToDuration(5),
+		VerifySSL:         true,
+	}
+
+	results, err := DiscoverModels(context.Background(), &http.Client{Timeout: 5 * time.Second}, cfg)
+	if err != nil {
+		t.Fatalf("DiscoverModels returned error: %v", err)
+	}
+	if len(results) != 1 || results[0].ModelID != "fallback-parse-error-model" {
+		t.Fatalf("unexpected discovery results: %#v", results)
+	}
+	if got := strings.Join(requests, " -> "); got != "/v1/models -> /models" {
+		t.Fatalf("unexpected candidate order: %s", got)
+	}
+}
+
 func TestModelsDiscoveryContinuesAfterEmptyResult(t *testing.T) {
 	t.Parallel()
 
@@ -415,7 +462,7 @@ func TestModelsDiscoveryStopsOnAuthOrRateLimitErrors(t *testing.T) {
 	}
 }
 
-func TestModelsEndpointRefreshesRouteMetadata(t *testing.T) {
+func TestModelsEndpointRefreshesRouteSnapshot(t *testing.T) {
 	t.Parallel()
 
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -442,6 +489,21 @@ func TestModelsEndpointRefreshesRouteMetadata(t *testing.T) {
 		VerifySSL:       true,
 	})
 
+	identity := RouteIdentityKey(server.config.UpstreamBaseURL, server.config.UpstreamAPIKey)
+	otherIdentity := RouteIdentityKey("https://other.example/v1", "other-secret")
+	server.routeTable.Store(identity, "legacy-model", RouteEntry{
+		ModelID:    "legacy-model",
+		Protocol:   RouteProtocolChat,
+		Endpoint:   "/v1/chat/completions",
+		Confidence: RouteConfidenceExplicit,
+	})
+	server.routeTable.Store(otherIdentity, "other-model", RouteEntry{
+		ModelID:    "other-model",
+		Protocol:   RouteProtocolChat,
+		Endpoint:   "/v1/chat/completions",
+		Confidence: RouteConfidenceExplicit,
+	})
+
 	request := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
 	recorder := httptest.NewRecorder()
 	server.ServeHTTP(recorder, request)
@@ -450,7 +512,11 @@ func TestModelsEndpointRefreshesRouteMetadata(t *testing.T) {
 		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
 	}
 
-	got, ok := server.routeTable.Resolve(RouteIdentityKey(server.config.UpstreamBaseURL, server.config.UpstreamAPIKey), "gpt-5.1")
+	if _, ok := server.routeTable.Resolve(identity, "legacy-model"); ok {
+		t.Fatal("expected stale model to be removed after refresh")
+	}
+
+	got, ok := server.routeTable.Resolve(identity, "gpt-5.1")
 	if !ok {
 		t.Fatal("expected GET /v1/models to refresh route metadata")
 	}
@@ -459,6 +525,12 @@ func TestModelsEndpointRefreshesRouteMetadata(t *testing.T) {
 	}
 	if got.Endpoint != "/v1/responses" {
 		t.Fatalf("unexpected endpoint: %q", got.Endpoint)
+	}
+
+	if got, ok := server.routeTable.Resolve(otherIdentity, "other-model"); !ok {
+		t.Fatal("expected refresh to leave other identities untouched")
+	} else if got.Protocol != RouteProtocolChat {
+		t.Fatalf("unexpected protocol for other identity: %q", got.Protocol)
 	}
 }
 

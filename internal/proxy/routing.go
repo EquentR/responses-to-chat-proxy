@@ -87,6 +87,36 @@ func (t *RouteTable) Store(identity RouteIdentity, model string, entry RouteEntr
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	return t.storeLocked(identity, model, entry)
+}
+
+func (t *RouteTable) ReplaceIdentity(identity RouteIdentity, entries []RouteEntry) {
+	if t == nil {
+		return
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if t.now == nil {
+		t.now = time.Now
+	}
+	if t.entries == nil {
+		t.entries = make(map[routeTableKey]RouteEntry)
+	}
+
+	for key := range t.entries {
+		if key.identity == identity {
+			delete(t.entries, key)
+		}
+	}
+
+	for _, entry := range entries {
+		t.storeLocked(identity, entry.ModelID, entry)
+	}
+}
+
+func (t *RouteTable) storeLocked(identity RouteIdentity, model string, entry RouteEntry) RouteEntry {
 	if t.now == nil {
 		t.now = time.Now
 	}

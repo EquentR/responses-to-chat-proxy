@@ -116,6 +116,7 @@ func discoverModelSelection(ctx context.Context, client *http.Client, cfg Config
 	}
 
 	var lastErr error
+	var lastParseErr error
 	var lastEmptyPage *modelDiscoveryPage
 
 	for _, candidate := range candidates {
@@ -137,7 +138,8 @@ func discoverModelSelection(ctx context.Context, client *http.Client, cfg Config
 
 		results, parseErr := ParseModelDiscoveryResults(page.Body)
 		if parseErr != nil {
-			return modelDiscoverySelection{}, parseErr
+			lastParseErr = parseErr
+			continue
 		}
 		if len(results) == 0 {
 			emptyPage := page
@@ -151,6 +153,9 @@ func discoverModelSelection(ctx context.Context, client *http.Client, cfg Config
 	if lastEmptyPage != nil {
 		return modelDiscoverySelection{Page: *lastEmptyPage, Results: nil}, nil
 	}
+	if lastParseErr != nil {
+		return modelDiscoverySelection{}, lastParseErr
+	}
 	if lastErr != nil {
 		return modelDiscoverySelection{}, lastErr
 	}
@@ -161,12 +166,12 @@ func ApplyDiscoveredModels(table *RouteTable, identity RouteIdentity, results []
 	if table == nil {
 		return
 	}
+	entries := make([]RouteEntry, 0, len(results))
 	for _, result := range results {
 		if result.ModelID == "" || result.Protocol == RouteProtocolUnknown {
 			continue
 		}
-
-		table.Store(identity, result.ModelID, RouteEntry{
+		entries = append(entries, RouteEntry{
 			ModelID:    result.ModelID,
 			Protocol:   result.Protocol,
 			Endpoint:   result.Endpoint,
@@ -175,6 +180,7 @@ func ApplyDiscoveredModels(table *RouteTable, identity RouteIdentity, results []
 			Reasoning:  result.Reasoning,
 		})
 	}
+	table.ReplaceIdentity(identity, entries)
 }
 
 func (s *Server) initializeStartupDiscovery(ctx context.Context) error {
