@@ -23,15 +23,25 @@ const (
 	RouteDetectionLazy          RouteDetectionMode = "lazy"
 	RouteDetectionStartup       RouteDetectionMode = "startup"
 	RouteDetectionOff           RouteDetectionMode = "off"
-	defaultRouteTableTTLSeconds                    = 24 * 60 * 60
-	defaultRouteProbeGeneration                    = 1
+	defaultRouteTableTTLSeconds                    = 30 * 60
+	defaultRouteProbeGeneration                    = false
+)
+
+type RouteConfidence string
+
+const (
+	RouteConfidenceExplicit       RouteConfidence = "explicit"
+	RouteConfidenceModelsMetadata RouteConfidence = "models_metadata"
+	RouteConfidenceProbeSuccess   RouteConfidence = "probe_success"
+	RouteConfidenceHeuristic      RouteConfidence = "heuristic"
+	RouteConfidenceFallback       RouteConfidence = "fallback"
 )
 
 type RouteEntry struct {
 	ModelID    string
 	Protocol   RouteProtocol
 	Endpoint   string
-	Confidence float64
+	Confidence RouteConfidence
 	Features   []string
 	Reasoning  string
 	DetectedAt time.Time

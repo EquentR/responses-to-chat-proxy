@@ -32,7 +32,7 @@ func TestRouteTableHonorsTTL(t *testing.T) {
 		ModelID:    "gpt-5.1",
 		Protocol:   RouteProtocolResponses,
 		Endpoint:   "/v1/responses",
-		Confidence: 0.91,
+		Confidence: RouteConfidenceProbeSuccess,
 		Features:   []string{"responses", "streaming"},
 		Reasoning:  "detected from startup probe",
 		LastError:  "",
@@ -50,10 +50,39 @@ func TestRouteTableHonorsTTL(t *testing.T) {
 	if got.ExpiresAt.IsZero() || !got.ExpiresAt.Equal(now.Add(time.Minute)) {
 		t.Fatalf("unexpected expiry: got %v, want %v", got.ExpiresAt, now.Add(time.Minute))
 	}
+	if got.Confidence != RouteConfidenceProbeSuccess {
+		t.Fatalf("unexpected confidence: got %q, want %q", got.Confidence, RouteConfidenceProbeSuccess)
+	}
 
 	now = now.Add(time.Minute + time.Second)
 	if _, ok := table.Resolve("identity-key", "gpt-5.1"); ok {
 		t.Fatal("expected route entry to expire after TTL")
+	}
+}
+
+func TestRouteTablePreservesCategoricalConfidence(t *testing.T) {
+	now := time.Date(2026, time.June, 27, 10, 0, 0, 0, time.UTC)
+	table := newRouteTableWithClock(time.Minute, func() time.Time {
+		return now
+	})
+
+	entry := RouteEntry{
+		ModelID:    "gpt-5.1",
+		Protocol:   RouteProtocolChat,
+		Endpoint:   "/v1/chat/completions",
+		Confidence: RouteConfidenceModelsMetadata,
+		Features:   []string{"chat"},
+		Reasoning:  "loaded from models metadata",
+	}
+
+	table.Store("identity-key", "gpt-5.1", entry)
+
+	got, ok := table.Resolve("identity-key", "gpt-5.1")
+	if !ok {
+		t.Fatal("expected route entry to resolve")
+	}
+	if got.Confidence != RouteConfidenceModelsMetadata {
+		t.Fatalf("unexpected confidence: got %q, want %q", got.Confidence, RouteConfidenceModelsMetadata)
 	}
 }
 
@@ -92,17 +121,17 @@ func TestLoadConfigRouteSettings(t *testing.T) {
 		if cfg.RouteDetection != RouteDetectionLazy {
 			t.Fatalf("unexpected default route detection mode: %q", cfg.RouteDetection)
 		}
-		if cfg.RouteTableTTLSeconds != 86400 {
+		if cfg.RouteTableTTLSeconds != 1800 {
 			t.Fatalf("unexpected default route TTL seconds: %v", cfg.RouteTableTTLSeconds)
 		}
-		if cfg.RouteTableTTL != 24*time.Hour {
+		if cfg.RouteTableTTL != 30*time.Minute {
 			t.Fatalf("unexpected default route TTL duration: %v", cfg.RouteTableTTL)
 		}
 		if cfg.RouteTablePersist {
 			t.Fatal("expected route table persistence to default to false")
 		}
-		if cfg.RouteProbeGeneration != 1 {
-			t.Fatalf("unexpected default probe generation: %d", cfg.RouteProbeGeneration)
+		if cfg.RouteProbeGeneration {
+			t.Fatal("expected route probe generation to default to false")
 		}
 	})
 
@@ -122,7 +151,7 @@ func TestLoadConfigRouteSettings(t *testing.T) {
 		t.Setenv("ROUTE_DETECTION", "startup")
 		t.Setenv("ROUTE_TABLE_TTL_SECONDS", "90")
 		t.Setenv("ROUTE_TABLE_PERSIST", "true")
-		t.Setenv("ROUTE_PROBE_GENERATION", "7")
+		t.Setenv("ROUTE_PROBE_GENERATION", "true")
 
 		cfg, err := LoadConfigFromEnv("")
 		if err != nil {
@@ -169,8 +198,8 @@ func TestLoadConfigRouteSettings(t *testing.T) {
 		if !cfg.RouteTablePersist {
 			t.Fatal("expected route table persistence to parse true")
 		}
-		if cfg.RouteProbeGeneration != 7 {
-			t.Fatalf("unexpected probe generation: %d", cfg.RouteProbeGeneration)
+		if !cfg.RouteProbeGeneration {
+			t.Fatal("expected route probe generation to parse true")
 		}
 	})
 }

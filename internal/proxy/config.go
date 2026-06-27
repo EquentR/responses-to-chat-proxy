@@ -18,7 +18,7 @@ type Config struct {
 	RouteTableTTLSeconds  float64
 	RouteTableTTL         time.Duration
 	RouteTablePersist     bool
-	RouteProbeGeneration  int
+	RouteProbeGeneration  bool
 	ProxyAPIKey           string
 	ModelOverride         string
 	Host                  string
@@ -56,7 +56,7 @@ func LoadConfigFromEnv(dotEnvPath string) (Config, error) {
 		RouteDetection:       parseRouteDetectionMode(envString("ROUTE_DETECTION", string(RouteDetectionLazy))),
 		RouteTableTTLSeconds: envFloat("ROUTE_TABLE_TTL_SECONDS", defaultRouteTableTTLSeconds),
 		RouteTablePersist:    envBool("ROUTE_TABLE_PERSIST", false),
-		RouteProbeGeneration: envInt("ROUTE_PROBE_GENERATION", defaultRouteProbeGeneration),
+		RouteProbeGeneration: envBool("ROUTE_PROBE_GENERATION", defaultRouteProbeGeneration),
 	}
 
 	cfg.UpstreamBaseURL = normalizeUpstreamBaseURL(cfg.UpstreamBaseURL)
