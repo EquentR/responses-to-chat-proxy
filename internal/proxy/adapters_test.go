@@ -31,6 +31,292 @@ func TestConvertRequestStringInput(t *testing.T) {
 	}
 }
 
+func TestConvertRequestPreservesInputFile(t *testing.T) {
+	converted := ConvertRequest(map[string]any{
+		"model": "test-model",
+		"input": []any{
+			map[string]any{
+				"type":      "input_file",
+				"file_id":   "file-123",
+				"file_data": "Zm9v",
+				"filename":  "notes.txt",
+			},
+		},
+	}, Config{})
+
+	want := []any{
+		map[string]any{
+			"role": "user",
+			"content": []any{
+				map[string]any{
+					"type": "file",
+					"file": map[string]any{
+						"file_id":   "file-123",
+						"file_data": "Zm9v",
+						"filename":  "notes.txt",
+					},
+				},
+			},
+		},
+	}
+
+	assertJSONEqual(t, want, converted["messages"])
+}
+
+func TestConvertRequestPreservesInputAudio(t *testing.T) {
+	converted := ConvertRequest(map[string]any{
+		"model": "test-model",
+		"input": []any{
+			map[string]any{
+				"type": "input_audio",
+				"input_audio": map[string]any{
+					"data":   "QUJD",
+					"format": "mp3",
+				},
+			},
+		},
+	}, Config{})
+
+	want := []any{
+		map[string]any{
+			"role": "user",
+			"content": []any{
+				map[string]any{
+					"type": "input_audio",
+					"input_audio": map[string]any{
+						"data":   "QUJD",
+						"format": "mp3",
+					},
+				},
+			},
+		},
+	}
+
+	assertJSONEqual(t, want, converted["messages"])
+}
+
+func TestConvertRequestHandlesTopLevelInputItems(t *testing.T) {
+	converted := ConvertRequest(map[string]any{
+		"model": "test-model",
+		"input": []any{
+			map[string]any{"type": "input_text", "text": "Hello"},
+			map[string]any{
+				"type":      "input_image",
+				"image_url": "https://example.com/image.png",
+				"detail":    "high",
+			},
+			map[string]any{
+				"type":      "input_file",
+				"file_id":   "file-123",
+				"file_data": "Zm9v",
+				"filename":  "notes.txt",
+			},
+			map[string]any{
+				"type": "input_audio",
+				"input_audio": map[string]any{
+					"data":   "QUJD",
+					"format": "wav",
+				},
+			},
+		},
+	}, Config{})
+
+	want := []any{
+		map[string]any{"role": "user", "content": "Hello"},
+		map[string]any{
+			"role": "user",
+			"content": []any{
+				map[string]any{
+					"type": "image_url",
+					"image_url": map[string]any{
+						"url":    "https://example.com/image.png",
+						"detail": "high",
+					},
+				},
+			},
+		},
+		map[string]any{
+			"role": "user",
+			"content": []any{
+				map[string]any{
+					"type": "file",
+					"file": map[string]any{
+						"file_id":   "file-123",
+						"file_data": "Zm9v",
+						"filename":  "notes.txt",
+					},
+				},
+			},
+		},
+		map[string]any{
+			"role": "user",
+			"content": []any{
+				map[string]any{
+					"type": "input_audio",
+					"input_audio": map[string]any{
+						"data":   "QUJD",
+						"format": "wav",
+					},
+				},
+			},
+		},
+	}
+
+	assertJSONEqual(t, want, converted["messages"])
+}
+
+func TestStreamingConverterKeepsToolContext(t *testing.T) {
+	chatRequest := ConvertRequest(map[string]any{
+		"model": "test-model",
+		"input": "Use the tools.",
+		"tools": []any{
+			map[string]any{
+				"type": "namespace",
+				"name": "crm",
+				"tools": []any{
+					map[string]any{
+						"type": "function",
+						"name": "get_customer_profile",
+						"parameters": map[string]any{
+							"type": "object",
+							"properties": map[string]any{
+								"customer_id": map[string]any{"type": "string"},
+							},
+							"required": []any{"customer_id"},
+						},
+					},
+				},
+			},
+			map[string]any{"type": "custom", "name": "code_exec", "description": "Run code."},
+			map[string]any{"type": "tool_search"},
+		},
+	}, Config{})
+
+	toolNames := map[string]string{}
+	for _, rawTool := range chatRequest["tools"].([]any) {
+		tool := rawTool.(map[string]any)
+		fn := tool["function"].(map[string]any)
+		name := fn["name"].(string)
+		switch name {
+		case "tool_search":
+			toolNames["tool_search"] = name
+		case "code_exec":
+			toolNames["custom"] = name
+		default:
+			toolNames["namespace"] = name
+		}
+	}
+
+	converter := NewStreamingConverter()
+	chunk := "data: " + mustJSON(map[string]any{
+		"id":      "chatcmpl-abc",
+		"created": 123,
+		"model":   "test-model",
+		"choices": []any{
+			map[string]any{
+				"delta": map[string]any{
+					"tool_calls": []any{
+						map[string]any{
+							"index": 0,
+							"id":    "call_ns",
+							"type":  "function",
+							"function": map[string]any{
+								"name":      toolNames["namespace"],
+								"arguments": `{"customer_id":"c-1"}`,
+							},
+						},
+						map[string]any{
+							"index": 1,
+							"id":    "call_ct",
+							"type":  "function",
+							"function": map[string]any{
+								"name":      toolNames["custom"],
+								"arguments": `{"input":"print(1)"}`,
+							},
+						},
+						map[string]any{
+							"index": 2,
+							"id":    "call_ts",
+							"type":  "function",
+							"function": map[string]any{
+								"name":      toolNames["tool_search"],
+								"arguments": `{"query":"crm tools"}`,
+							},
+						},
+					},
+				},
+				"finish_reason": nil,
+			},
+		},
+	}) + "\n\n" + "data: " + mustJSON(map[string]any{
+		"id":      "chatcmpl-abc",
+		"created": 123,
+		"model":   "test-model",
+		"choices": []any{
+			map[string]any{"delta": map[string]any{}, "finish_reason": "tool_calls"},
+		},
+	}) + "\n\n"
+
+	payloads := ssePayloads(converter.Feed([]byte(chunk)))
+	completed := findPayload(payloads, "response.completed")
+	if completed == nil {
+		t.Fatalf("missing response.completed payloads=%#v", payloads)
+	}
+
+	response := completed["response"].(map[string]any)
+	output := response["output"].([]any)
+	if len(output) != 3 {
+		t.Fatalf("unexpected output count: %#v", output)
+	}
+
+	nsItem := output[0].(map[string]any)
+	if nsItem["type"] != "function_call" || nsItem["namespace"] != "crm" || nsItem["name"] != "get_customer_profile" {
+		t.Fatalf("unexpected namespace item: %#v", nsItem)
+	}
+
+	customItem := output[1].(map[string]any)
+	if customItem["type"] != "custom_tool_call" || customItem["name"] != "code_exec" || customItem["input"] != "print(1)" {
+		t.Fatalf("unexpected custom item: %#v", customItem)
+	}
+
+	toolSearchItem := output[2].(map[string]any)
+	if toolSearchItem["type"] != "tool_search_call" || toolSearchItem["execution"] != "client" {
+		t.Fatalf("unexpected tool search item: %#v", toolSearchItem)
+	}
+}
+
+func TestChatStreamEOFWithoutFinishReasonProducesIncompleteOrFailed(t *testing.T) {
+	withOutput := NewStreamingConverter()
+	withOutputPayloads := ssePayloads(withOutput.Feed([]byte("data: " + mustJSON(map[string]any{
+		"id":      "chatcmpl-abc",
+		"created": 123,
+		"model":   "test-model",
+		"choices": []any{
+			map[string]any{
+				"delta": map[string]any{"content": "Hello"},
+			},
+		},
+	}) + "\n\n")))
+	withOutputPayloads = append(withOutputPayloads, ssePayloads(withOutput.Finish())...)
+	completed := findPayload(withOutputPayloads, "response.completed")
+	if completed == nil {
+		t.Fatalf("missing completion payload for substantive output: %#v", withOutputPayloads)
+	}
+	if response := completed["response"].(map[string]any); response["status"] != "incomplete" {
+		t.Fatalf("expected incomplete status, got %#v", response["status"])
+	}
+
+	empty := NewStreamingConverter()
+	emptyPayloads := ssePayloads(empty.Finish())
+	completed = findPayload(emptyPayloads, "response.completed")
+	if completed == nil {
+		t.Fatalf("missing completion payload for empty stream: %#v", emptyPayloads)
+	}
+	if response := completed["response"].(map[string]any); response["status"] != "failed" {
+		t.Fatalf("expected failed status, got %#v", response["status"])
+	}
+}
+
 func TestConvertResponseNonStreaming(t *testing.T) {
 	converted := ConvertResponse(map[string]any{
 		"id":      "chatcmpl-abc",
@@ -63,6 +349,51 @@ func TestConvertResponseNonStreaming(t *testing.T) {
 	usage := converted["usage"].(map[string]any)
 	if usage["input_tokens"] != 2 || usage["output_tokens"] != 3 {
 		t.Fatalf("unexpected usage: %#v", usage)
+	}
+}
+
+func TestReasoningExtractionCoversObjectShapeAndThinkTags(t *testing.T) {
+	converted := ConvertResponse(map[string]any{
+		"id":      "chatcmpl-abc",
+		"created": 123,
+		"model":   "test-model",
+		"choices": []any{
+			map[string]any{
+				"finish_reason": "stop",
+				"message": map[string]any{
+					"role": "assistant",
+					"reasoning": map[string]any{
+						"summary": []any{
+							map[string]any{"type": "summary_text", "text": "Object summary."},
+						},
+						"content": []any{
+							map[string]any{"type": "reasoning_text", "text": "Object thought."},
+						},
+					},
+					"content": "<think>Tagged thought.</think>Visible answer.",
+				},
+			},
+		},
+		"usage": map[string]any{"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5},
+	}, map[string]any{"model": "test-model", "input": "Hello"})
+
+	output := converted["output"].([]any)
+	if len(output) != 2 {
+		t.Fatalf("unexpected output length: %#v", output)
+	}
+
+	reasoning := output[0].(map[string]any)
+	summary := reasoning["summary"].([]any)
+	summaryText := summary[0].(map[string]any)["text"]
+	if summaryText != "Object summary.\nObject thought.\nTagged thought." {
+		t.Fatalf("unexpected reasoning summary: %v", summaryText)
+	}
+
+	message := output[1].(map[string]any)
+	content := message["content"].([]any)
+	part := content[0].(map[string]any)
+	if part["text"] != "Visible answer." {
+		t.Fatalf("unexpected visible text: %v", part["text"])
 	}
 }
 
@@ -246,6 +577,15 @@ func ssePayloads(events []string) []map[string]any {
 		}
 	}
 	return payloads
+}
+
+func findPayload(payloads []map[string]any, typ string) map[string]any {
+	for _, payload := range payloads {
+		if payload["type"] == typ {
+			return payload
+		}
+	}
+	return nil
 }
 
 func splitLines(value string) []string {
