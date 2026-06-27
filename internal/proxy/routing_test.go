@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -17,8 +18,38 @@ func TestRouteIdentityKeyIsStable(t *testing.T) {
 	if got1 != got2 {
 		t.Fatalf("expected stable identity key, got %q and %q", got1, got2)
 	}
-	if strings.Contains(got1, apiKey) {
+	if strings.Contains(string(got1), apiKey) {
 		t.Fatalf("identity key must not contain the raw API key, got %q", got1)
+	}
+}
+
+func TestRouteIdentityKeyUsesDedicatedType(t *testing.T) {
+	identityType := reflect.TypeOf(RouteIdentityKey("https://example.com/v1/", "sk-test-routing-secret"))
+	if identityType.Kind() != reflect.String {
+		t.Fatalf("expected RouteIdentityKey to return a string-like type, got %v", identityType)
+	}
+	if identityType.Name() == "string" || identityType.PkgPath() == "" {
+		t.Fatalf("expected RouteIdentityKey to return a dedicated named type, got %v", identityType)
+	}
+
+	tableType := reflect.TypeOf(&RouteTable{})
+	storeMethod, ok := tableType.MethodByName("Store")
+	if !ok {
+		t.Fatal("RouteTable.Store method not found")
+	}
+	resolveMethod, ok := tableType.MethodByName("Resolve")
+	if !ok {
+		t.Fatal("RouteTable.Resolve method not found")
+	}
+
+	if got := storeMethod.Type.In(1); got.Name() == "string" || got.PkgPath() == "" {
+		t.Fatalf("expected RouteTable.Store identity argument to use a dedicated type, got %v", got)
+	}
+	if got := resolveMethod.Type.In(1); got.Name() == "string" || got.PkgPath() == "" {
+		t.Fatalf("expected RouteTable.Resolve identity argument to use a dedicated type, got %v", got)
+	}
+	if storeMethod.Type.In(1) != resolveMethod.Type.In(1) {
+		t.Fatalf("expected RouteTable Store and Resolve identity types to match, got %v and %v", storeMethod.Type.In(1), resolveMethod.Type.In(1))
 	}
 }
 
@@ -38,9 +69,10 @@ func TestRouteTableHonorsTTL(t *testing.T) {
 		LastError:  "",
 	}
 
-	table.Store("identity-key", "gpt-5.1", entry)
+	identity := RouteIdentityKey("https://example.com/v1/", "sk-test-routing-secret")
+	table.Store(identity, "gpt-5.1", entry)
 
-	got, ok := table.Resolve("identity-key", "gpt-5.1")
+	got, ok := table.Resolve(identity, "gpt-5.1")
 	if !ok {
 		t.Fatal("expected route entry to resolve before TTL expiry")
 	}
@@ -55,8 +87,45 @@ func TestRouteTableHonorsTTL(t *testing.T) {
 	}
 
 	now = now.Add(time.Minute + time.Second)
-	if _, ok := table.Resolve("identity-key", "gpt-5.1"); ok {
+	if _, ok := table.Resolve(identity, "gpt-5.1"); ok {
 		t.Fatal("expected route entry to expire after TTL")
+	}
+}
+
+func TestRouteTableNormalizesNonPositiveTTL(t *testing.T) {
+	for _, ttl := range []time.Duration{0, -time.Second} {
+		t.Run(ttl.String(), func(t *testing.T) {
+			now := time.Date(2026, time.June, 27, 10, 0, 0, 0, time.UTC)
+			table := newRouteTableWithClock(ttl, func() time.Time {
+				return now
+			})
+
+			identity := RouteIdentityKey("https://example.com/v1/", "sk-test-routing-secret")
+			entry := RouteEntry{
+				ModelID:    "gpt-5.1",
+				Protocol:   RouteProtocolResponses,
+				Endpoint:   "/v1/responses",
+				Confidence: RouteConfidenceProbeSuccess,
+			}
+
+			got := table.Store(identity, "gpt-5.1", entry)
+			wantExpiry := now.Add(30 * time.Minute)
+			if got.ExpiresAt.IsZero() {
+				t.Fatal("expected route table to assign an expiry for non-positive TTL")
+			}
+			if !got.ExpiresAt.Equal(wantExpiry) {
+				t.Fatalf("unexpected expiry: got %v, want %v", got.ExpiresAt, wantExpiry)
+			}
+
+			if _, ok := table.Resolve(identity, "gpt-5.1"); !ok {
+				t.Fatal("expected route entry to resolve before normalized TTL expiry")
+			}
+
+			now = now.Add(30*time.Minute + time.Second)
+			if _, ok := table.Resolve(identity, "gpt-5.1"); ok {
+				t.Fatal("expected route entry to expire after normalized TTL")
+			}
+		})
 	}
 }
 
@@ -75,9 +144,10 @@ func TestRouteTablePreservesCategoricalConfidence(t *testing.T) {
 		Reasoning:  "loaded from models metadata",
 	}
 
-	table.Store("identity-key", "gpt-5.1", entry)
+	identity := RouteIdentityKey("https://example.com/v1/", "sk-test-routing-secret")
+	table.Store(identity, "gpt-5.1", entry)
 
-	got, ok := table.Resolve("identity-key", "gpt-5.1")
+	got, ok := table.Resolve(identity, "gpt-5.1")
 	if !ok {
 		t.Fatal("expected route entry to resolve")
 	}
@@ -202,6 +272,26 @@ func TestLoadConfigRouteSettings(t *testing.T) {
 			t.Fatal("expected route probe generation to parse true")
 		}
 	})
+}
+
+func TestLoadConfigNormalizesNonPositiveRouteTableTTL(t *testing.T) {
+	for _, value := range []string{"0", "-1"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("ROUTE_TABLE_TTL_SECONDS", value)
+
+			cfg, err := LoadConfigFromEnv("")
+			if err != nil {
+				t.Fatalf("LoadConfigFromEnv returned error: %v", err)
+			}
+
+			if cfg.RouteTableTTLSeconds != defaultRouteTableTTLSeconds {
+				t.Fatalf("unexpected route TTL seconds: got %v, want %v", cfg.RouteTableTTLSeconds, defaultRouteTableTTLSeconds)
+			}
+			if cfg.RouteTableTTL != 30*time.Minute {
+				t.Fatalf("unexpected route TTL duration: got %v, want %v", cfg.RouteTableTTL, 30*time.Minute)
+			}
+		})
+	}
 }
 
 func unsetEnvKeys(t *testing.T, keys ...string) {

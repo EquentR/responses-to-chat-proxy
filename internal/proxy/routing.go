@@ -37,6 +37,9 @@ const (
 	RouteConfidenceFallback       RouteConfidence = "fallback"
 )
 
+// RouteIdentity is the canonical normalized upstream identity used by the route table.
+type RouteIdentity string
+
 type RouteEntry struct {
 	ModelID    string
 	Protocol   RouteProtocol
@@ -57,7 +60,7 @@ type RouteTable struct {
 }
 
 type routeTableKey struct {
-	identity string
+	identity RouteIdentity
 	model    string
 }
 
@@ -70,13 +73,13 @@ func newRouteTableWithClock(ttl time.Duration, now func() time.Time) *RouteTable
 		now = time.Now
 	}
 	return &RouteTable{
-		ttl:     ttl,
+		ttl:     normalizeRouteTableTTL(ttl),
 		now:     now,
 		entries: make(map[routeTableKey]RouteEntry),
 	}
 }
 
-func (t *RouteTable) Store(identity, model string, entry RouteEntry) RouteEntry {
+func (t *RouteTable) Store(identity RouteIdentity, model string, entry RouteEntry) RouteEntry {
 	if t == nil {
 		return RouteEntry{}
 	}
@@ -92,7 +95,7 @@ func (t *RouteTable) Store(identity, model string, entry RouteEntry) RouteEntry 
 	}
 
 	key := routeTableKey{
-		identity: strings.TrimSpace(identity),
+		identity: identity,
 		model:    normalizeModelID(model),
 	}
 
@@ -101,8 +104,8 @@ func (t *RouteTable) Store(identity, model string, entry RouteEntry) RouteEntry 
 	if entry.DetectedAt.IsZero() {
 		entry.DetectedAt = now
 	}
-	if entry.ExpiresAt.IsZero() && t.ttl > 0 {
-		entry.ExpiresAt = now.Add(t.ttl)
+	if entry.ExpiresAt.IsZero() {
+		entry.ExpiresAt = now.Add(normalizeRouteTableTTL(t.ttl))
 	}
 	entry.Features = cloneStringSlice(entry.Features)
 
@@ -110,7 +113,7 @@ func (t *RouteTable) Store(identity, model string, entry RouteEntry) RouteEntry 
 	return cloneRouteEntry(entry)
 }
 
-func (t *RouteTable) Resolve(identity, model string) (RouteEntry, bool) {
+func (t *RouteTable) Resolve(identity RouteIdentity, model string) (RouteEntry, bool) {
 	if t == nil {
 		return RouteEntry{}, false
 	}
@@ -126,7 +129,7 @@ func (t *RouteTable) Resolve(identity, model string) (RouteEntry, bool) {
 	}
 
 	key := routeTableKey{
-		identity: strings.TrimSpace(identity),
+		identity: identity,
 		model:    normalizeModelID(model),
 	}
 
@@ -142,8 +145,19 @@ func (t *RouteTable) Resolve(identity, model string) (RouteEntry, bool) {
 	return cloneRouteEntry(entry), true
 }
 
-func RouteIdentityKey(upstreamBaseURL, apiKey string) string {
-	return normalizeUpstreamBaseURL(upstreamBaseURL) + "|" + routeAPIKeyFingerprint(apiKey)
+func RouteIdentityKey(upstreamBaseURL, apiKey string) RouteIdentity {
+	return RouteIdentity(normalizeUpstreamBaseURL(upstreamBaseURL) + "|" + routeAPIKeyFingerprint(apiKey))
+}
+
+func normalizeRouteTableTTL(ttl time.Duration) time.Duration {
+	if ttl <= 0 {
+		return defaultRouteTableTTLDuration()
+	}
+	return ttl
+}
+
+func defaultRouteTableTTLDuration() time.Duration {
+	return time.Duration(defaultRouteTableTTLSeconds) * time.Second
 }
 
 func normalizeUpstreamBaseURL(value string) string {

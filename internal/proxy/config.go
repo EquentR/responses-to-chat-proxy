@@ -62,6 +62,7 @@ func LoadConfigFromEnv(dotEnvPath string) (Config, error) {
 	cfg.UpstreamBaseURL = normalizeUpstreamBaseURL(cfg.UpstreamBaseURL)
 	cfg.RequestTimeout = secondsToDuration(cfg.RequestTimeoutSeconds)
 	cfg.StreamTimeout = secondsToDuration(cfg.StreamTimeoutSeconds)
+	cfg.RouteTableTTLSeconds = normalizeRouteTableTTLSeconds(cfg.RouteTableTTLSeconds)
 	cfg.RouteTableTTL = secondsToDuration(cfg.RouteTableTTLSeconds)
 
 	if cfg.UpstreamBaseURL == "" {
@@ -160,4 +161,11 @@ func envBool(key string, fallback bool) bool {
 
 func secondsToDuration(seconds float64) time.Duration {
 	return time.Duration(seconds * float64(time.Second))
+}
+
+func normalizeRouteTableTTLSeconds(seconds float64) float64 {
+	if seconds <= 0 {
+		return defaultRouteTableTTLSeconds
+	}
+	return seconds
 }
