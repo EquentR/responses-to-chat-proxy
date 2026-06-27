@@ -123,6 +123,9 @@ func TestModelsDiscoveryFallsBackAcrossCandidates(t *testing.T) {
 		case "/anthropic/v1/models":
 			w.WriteHeader(http.StatusNotFound)
 			_ = json.NewEncoder(w).Encode(map[string]any{"error": "not found"})
+		case "/anthropic/models":
+			w.WriteHeader(http.StatusNotFound)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": "still not here"})
 		case "/v1/models":
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"data": []any{
@@ -155,7 +158,7 @@ func TestModelsDiscoveryFallsBackAcrossCandidates(t *testing.T) {
 	if len(results) != 1 {
 		t.Fatalf("expected one discovered model, got %d", len(results))
 	}
-	if got := strings.Join(requests, " -> "); got != "/anthropic/v1/models -> /v1/models" {
+	if got := strings.Join(requests, " -> "); got != "/anthropic/v1/models -> /anthropic/models -> /v1/models" {
 		t.Fatalf("unexpected candidate order: %s", got)
 	}
 
@@ -169,6 +172,150 @@ func TestModelsDiscoveryFallsBackAcrossCandidates(t *testing.T) {
 	}
 	if got.Endpoint != "/v1/responses" {
 		t.Fatalf("unexpected stored endpoint: %q", got.Endpoint)
+	}
+}
+
+func TestModelsDiscoveryContinuesAfter501(t *testing.T) {
+	t.Parallel()
+
+	var requests []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests = append(requests, r.URL.Path)
+
+		switch r.URL.Path {
+		case "/v1/models":
+			w.WriteHeader(http.StatusNotImplemented)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": "not implemented"})
+		case "/models":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": []any{
+					map[string]any{"id": "fallback-model", "protocol": "responses"},
+				},
+			})
+		default:
+			t.Fatalf("unexpected candidate path: %s", r.URL.Path)
+		}
+	}))
+	defer upstream.Close()
+
+	cfg := Config{
+		UpstreamBaseURL:   upstream.URL,
+		UpstreamAPIKey:    "upstream-secret",
+		UpstreamModelsURL: "",
+		RequestTimeout:    secondsToDuration(5),
+		StreamTimeout:     secondsToDuration(5),
+		VerifySSL:         true,
+	}
+
+	results, err := DiscoverModels(context.Background(), &http.Client{Timeout: 5 * time.Second}, cfg)
+	if err != nil {
+		t.Fatalf("DiscoverModels returned error: %v", err)
+	}
+	if len(results) != 1 || results[0].ModelID != "fallback-model" {
+		t.Fatalf("unexpected discovery results: %#v", results)
+	}
+	if got := strings.Join(requests, " -> "); got != "/v1/models -> /models" {
+		t.Fatalf("unexpected candidate order: %s", got)
+	}
+}
+
+func TestModelsDiscoveryContinuesAfterEmptyResult(t *testing.T) {
+	t.Parallel()
+
+	var requests []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests = append(requests, r.URL.Path)
+
+		switch r.URL.Path {
+		case "/v1/models":
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": []any{}})
+		case "/models":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": []any{
+					map[string]any{
+						"id":                  "fallback-empty-list-model",
+						"supported_endpoints": []any{"responses"},
+					},
+				},
+			})
+		default:
+			t.Fatalf("unexpected candidate path: %s", r.URL.Path)
+		}
+	}))
+	defer upstream.Close()
+
+	cfg := Config{
+		UpstreamBaseURL:   upstream.URL,
+		UpstreamAPIKey:    "upstream-secret",
+		UpstreamModelsURL: "",
+		RequestTimeout:    secondsToDuration(5),
+		StreamTimeout:     secondsToDuration(5),
+		VerifySSL:         true,
+	}
+
+	results, err := DiscoverModels(context.Background(), &http.Client{Timeout: 5 * time.Second}, cfg)
+	if err != nil {
+		t.Fatalf("DiscoverModels returned error: %v", err)
+	}
+	if len(results) != 1 || results[0].ModelID != "fallback-empty-list-model" {
+		t.Fatalf("unexpected discovery results: %#v", results)
+	}
+	if got := strings.Join(requests, " -> "); got != "/v1/models -> /models" {
+		t.Fatalf("unexpected candidate order: %s", got)
+	}
+}
+
+func TestModelsDiscoveryInfersFallbackProtocolsWithoutMetadata(t *testing.T) {
+	t.Parallel()
+
+	body := `{
+		"data": [
+			{"id": "claude-4"},
+			{"id": "gpt-4.1"},
+			{"id": "o1-mini"},
+			{"id": "local-model"}
+		]
+	}`
+
+	results, err := ParseModelDiscoveryResults([]byte(body))
+	if err != nil {
+		t.Fatalf("ParseModelDiscoveryResults returned error: %v", err)
+	}
+
+	routeTable := newRouteTableWithClock(time.Minute, func() time.Time {
+		return time.Date(2026, time.June, 27, 11, 0, 0, 0, time.UTC)
+	})
+	identity := RouteIdentityKey("https://upstream.example/v1", "api-key")
+	ApplyDiscoveredModels(routeTable, identity, results)
+
+	tests := []struct {
+		modelID   string
+		wantProto RouteProtocol
+		wantEP    string
+		wantConf  RouteConfidence
+	}{
+		{modelID: "claude-4", wantProto: RouteProtocolMessages, wantEP: "/v1/messages", wantConf: RouteConfidenceHeuristic},
+		{modelID: "gpt-4.1", wantProto: RouteProtocolResponses, wantEP: "/v1/responses", wantConf: RouteConfidenceHeuristic},
+		{modelID: "o1-mini", wantProto: RouteProtocolResponses, wantEP: "/v1/responses", wantConf: RouteConfidenceHeuristic},
+		{modelID: "local-model", wantProto: RouteProtocolChat, wantEP: "/v1/chat/completions", wantConf: RouteConfidenceFallback},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.modelID, func(t *testing.T) {
+			got, ok := routeTable.Resolve(identity, tt.modelID)
+			if !ok {
+				t.Fatalf("expected route for %s to be stored", tt.modelID)
+			}
+			if got.Protocol != tt.wantProto {
+				t.Fatalf("unexpected protocol: got %q want %q", got.Protocol, tt.wantProto)
+			}
+			if got.Endpoint != tt.wantEP {
+				t.Fatalf("unexpected endpoint: got %q want %q", got.Endpoint, tt.wantEP)
+			}
+			if got.Confidence != tt.wantConf {
+				t.Fatalf("unexpected confidence: got %q want %q", got.Confidence, tt.wantConf)
+			}
+		})
 	}
 }
 

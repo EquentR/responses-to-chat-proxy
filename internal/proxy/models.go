@@ -30,16 +30,12 @@ func DiscoverModels(ctx context.Context, client *http.Client, cfg Config) ([]Mod
 		client = http.DefaultClient
 	}
 
-	page, err := fetchModelDiscoveryPage(ctx, client, cfg, nil)
+	selection, err := discoverModelSelection(ctx, client, cfg, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	results, err := ParseModelDiscoveryResults(page.Body)
-	if err != nil {
-		return nil, err
-	}
-	return results, nil
+	return selection.Results, nil
 }
 
 func ParseModelDiscoveryResults(raw []byte) ([]ModelDiscoveryResult, error) {
@@ -65,6 +61,11 @@ type modelDiscoveryPage struct {
 	ContentType string
 }
 
+type modelDiscoverySelection struct {
+	Page    modelDiscoveryPage
+	Results []ModelDiscoveryResult
+}
+
 type modelDiscoveryError struct {
 	statusCode int
 	message    string
@@ -77,56 +78,83 @@ func (e *modelDiscoveryError) Error() string {
 	return e.message
 }
 
-func fetchModelDiscoveryPage(ctx context.Context, client *http.Client, cfg Config, incoming http.Header) (modelDiscoveryPage, error) {
+func fetchModelDiscoveryPage(ctx context.Context, client *http.Client, cfg Config, incoming http.Header, candidate string) (modelDiscoveryPage, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, candidate, nil)
+	if err != nil {
+		return modelDiscoveryPage{}, err
+	}
+	req.Header = copyHeaders(incoming, cfg.UpstreamAPIKey)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return modelDiscoveryPage{}, fmt.Errorf("models discovery failed: %w", err)
+	}
+
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxModelsResponseBytes))
+	contentType := resp.Header.Get("Content-Type")
+	_ = resp.Body.Close()
+	if readErr != nil {
+		return modelDiscoveryPage{}, fmt.Errorf("models discovery failed reading upstream response: %w", readErr)
+	}
+
+	return modelDiscoveryPage{
+		Body:        body,
+		StatusCode:  resp.StatusCode,
+		ContentType: contentType,
+	}, nil
+}
+
+func discoverModelSelection(ctx context.Context, client *http.Client, cfg Config, incoming http.Header) (modelDiscoverySelection, error) {
+	if client == nil {
+		client = http.DefaultClient
+	}
+
 	candidates := modelDiscoveryCandidates(cfg.UpstreamBaseURL, cfg.UpstreamModelsURL)
 	if len(candidates) == 0 {
-		return modelDiscoveryPage{}, errors.New("models discovery has no endpoint candidates")
+		return modelDiscoverySelection{}, errors.New("models discovery has no endpoint candidates")
 	}
 
 	var lastErr error
+	var lastEmptyPage *modelDiscoveryPage
+
 	for _, candidate := range candidates {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, candidate, nil)
+		page, err := fetchModelDiscoveryPage(ctx, client, cfg, incoming, candidate)
 		if err != nil {
-			lastErr = err
+			return modelDiscoverySelection{}, err
+		}
+
+		if page.StatusCode == http.StatusNotFound || page.StatusCode == http.StatusMethodNotAllowed || page.StatusCode == http.StatusNotImplemented {
+			lastErr = fmt.Errorf("models discovery candidate returned HTTP %d", page.StatusCode)
 			continue
 		}
-		req.Header = copyHeaders(incoming, cfg.UpstreamAPIKey)
-		req.Header.Set("Accept", "application/json")
-
-		resp, err := client.Do(req)
-		if err != nil {
-			return modelDiscoveryPage{}, fmt.Errorf("models discovery failed: %w", err)
-		}
-
-		body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxModelsResponseBytes))
-		contentType := resp.Header.Get("Content-Type")
-		_ = resp.Body.Close()
-		if readErr != nil {
-			return modelDiscoveryPage{}, fmt.Errorf("models discovery failed reading upstream response: %w", readErr)
-		}
-
-		if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed {
-			lastErr = fmt.Errorf("models discovery candidate returned HTTP %d", resp.StatusCode)
-			continue
-		}
-		if resp.StatusCode >= http.StatusBadRequest {
-			return modelDiscoveryPage{}, &modelDiscoveryError{
-				statusCode: resp.StatusCode,
-				message:    sanitizedModelsDiscoveryError(resp.StatusCode).Error(),
+		if page.StatusCode >= http.StatusBadRequest {
+			return modelDiscoverySelection{}, &modelDiscoveryError{
+				statusCode: page.StatusCode,
+				message:    sanitizedModelsDiscoveryError(page.StatusCode).Error(),
 			}
 		}
 
-		return modelDiscoveryPage{
-			Body:        body,
-			StatusCode:  resp.StatusCode,
-			ContentType: contentType,
-		}, nil
+		results, parseErr := ParseModelDiscoveryResults(page.Body)
+		if parseErr != nil {
+			return modelDiscoverySelection{}, parseErr
+		}
+		if len(results) == 0 {
+			emptyPage := page
+			lastEmptyPage = &emptyPage
+			continue
+		}
+
+		return modelDiscoverySelection{Page: page, Results: results}, nil
 	}
 
-	if lastErr != nil {
-		return modelDiscoveryPage{}, lastErr
+	if lastEmptyPage != nil {
+		return modelDiscoverySelection{Page: *lastEmptyPage, Results: nil}, nil
 	}
-	return modelDiscoveryPage{}, errors.New("models discovery failed")
+	if lastErr != nil {
+		return modelDiscoverySelection{}, lastErr
+	}
+	return modelDiscoverySelection{}, errors.New("models discovery failed")
 }
 
 func ApplyDiscoveredModels(table *RouteTable, identity RouteIdentity, results []ModelDiscoveryResult) {
@@ -154,38 +182,31 @@ func (s *Server) initializeStartupDiscovery(ctx context.Context) error {
 		return nil
 	}
 
-	page, err := fetchModelDiscoveryPage(ctx, s.normalClient, s.config, nil)
+	selection, err := discoverModelSelection(ctx, s.normalClient, s.config, nil)
 	if err != nil {
 		return err
 	}
 
-	results, err := ParseModelDiscoveryResults(page.Body)
-	if err != nil {
-		return err
-	}
-
-	ApplyDiscoveredModels(s.routeTable, RouteIdentityKey(s.config.UpstreamBaseURL, s.config.UpstreamAPIKey), results)
+	ApplyDiscoveredModels(s.routeTable, RouteIdentityKey(s.config.UpstreamBaseURL, s.config.UpstreamAPIKey), selection.Results)
 	return nil
 }
 
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
-	page, err := fetchModelDiscoveryPage(r.Context(), s.normalClient, s.config, r.Header)
+	selection, err := discoverModelSelection(r.Context(), s.normalClient, s.config, r.Header)
 	if err != nil {
 		writeDiscoveryError(w, err)
 		return
 	}
 
-	if results, parseErr := ParseModelDiscoveryResults(page.Body); parseErr == nil {
-		ApplyDiscoveredModels(s.routeTable, RouteIdentityKey(s.config.UpstreamBaseURL, s.config.UpstreamAPIKey), results)
-	}
+	ApplyDiscoveredModels(s.routeTable, RouteIdentityKey(s.config.UpstreamBaseURL, s.config.UpstreamAPIKey), selection.Results)
 
-	contentType := page.ContentType
+	contentType := selection.Page.ContentType
 	if contentType == "" {
 		contentType = "application/json"
 	}
 	w.Header().Set("Content-Type", contentType)
-	w.WriteHeader(page.StatusCode)
-	_, _ = w.Write(page.Body)
+	w.WriteHeader(selection.Page.StatusCode)
+	_, _ = w.Write(selection.Page.Body)
 }
 
 func modelDiscoveryCandidates(baseURL, explicitModelsURL string) []string {
@@ -199,15 +220,13 @@ func modelDiscoveryCandidates(baseURL, explicitModelsURL string) []string {
 		return candidates
 	}
 
-	if hasVersionPathSuffix(base) {
-		candidates = appendUniqueString(candidates, base+"/models")
-	} else {
-		candidates = appendUniqueString(candidates, base+"/v1/models")
-	}
-
-	for _, stripped := range strippedCompatibilityBases(base) {
-		candidates = appendUniqueString(candidates, stripped+"/v1/models")
-		candidates = appendUniqueString(candidates, stripped+"/models")
+	for _, variant := range modelDiscoveryBaseVariants(base) {
+		if hasVersionPathSuffix(variant) {
+			candidates = appendUniqueString(candidates, variant+"/models")
+			continue
+		}
+		candidates = appendUniqueString(candidates, variant+"/v1/models")
+		candidates = appendUniqueString(candidates, variant+"/models")
 	}
 
 	return candidates
@@ -279,23 +298,17 @@ func normalizeModelDiscoveryItem(raw map[string]any) (ModelDiscoveryResult, bool
 		}
 	}
 
+	if protocol == RouteProtocolUnknown {
+		inferredProtocol, inferredConfidence, note := inferProtocolFromModelID(modelID)
+		protocol = inferredProtocol
+		protocolCandidates = appendUniqueRouteProtocol(protocolCandidates, inferredProtocol)
+		reasonNotes = append(reasonNotes, note)
+		confidence = inferredConfidence
+	}
+
 	endpoint := explicitEndpoint
 	if endpoint == "" && protocol != RouteProtocolUnknown {
 		endpoint = defaultEndpointForProtocol(protocol)
-		if confidence == RouteConfidenceFallback {
-			confidence = RouteConfidenceModelsMetadata
-		}
-	}
-
-	if protocol == RouteProtocolUnknown && endpoint != "" {
-		if inferred := inferProtocolFromSignals(endpoint, nil); inferred != RouteProtocolUnknown {
-			protocol = inferred
-			protocolCandidates = appendUniqueRouteProtocol(protocolCandidates, inferred)
-			reasonNotes = append(reasonNotes, "endpoint path implies protocol")
-			if confidence == RouteConfidenceFallback {
-				confidence = RouteConfidenceExplicit
-			}
-		}
 	}
 
 	features := collectModelFeatures(raw)
@@ -305,9 +318,6 @@ func normalizeModelDiscoveryItem(raw map[string]any) (ModelDiscoveryResult, bool
 	}
 	if reasoning == "" && protocol != RouteProtocolUnknown {
 		reasoning = "loaded from models metadata"
-	}
-	if confidence == RouteConfidenceFallback && protocol != RouteProtocolUnknown {
-		confidence = RouteConfidenceModelsMetadata
 	}
 
 	return ModelDiscoveryResult{
@@ -409,6 +419,26 @@ func inferProtocolFromSignals(endpoint string, signals []string) RouteProtocol {
 		}
 	}
 	return RouteProtocolUnknown
+}
+
+func inferProtocolFromModelID(modelID string) (RouteProtocol, RouteConfidence, string) {
+	normalized := strings.ToLower(strings.TrimSpace(modelID))
+	switch {
+	case strings.Contains(normalized, "claude"):
+		return RouteProtocolMessages, RouteConfidenceHeuristic, "model id suggests anthropic messages"
+	case strings.Contains(normalized, "gpt"), strings.Contains(normalized, "openai"), looksLikeOpenAIResponsesModel(normalized):
+		return RouteProtocolResponses, RouteConfidenceHeuristic, "model id suggests openai responses"
+	default:
+		return RouteProtocolChat, RouteConfidenceFallback, "model id does not match a known provider; defaulted to chat"
+	}
+}
+
+func looksLikeOpenAIResponsesModel(value string) bool {
+	if len(value) < 2 || value[0] != 'o' {
+		return false
+	}
+	next := value[1]
+	return next >= '0' && next <= '9'
 }
 
 func normalizeRouteProtocol(value string) RouteProtocol {
@@ -536,6 +566,69 @@ func hasVersionPathSuffix(rawURL string) bool {
 		}
 	}
 	return true
+}
+
+func stripTrailingVersionSegment(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+	if len(parts) == 0 {
+		return rawURL
+	}
+	last := parts[len(parts)-1]
+	if len(last) < 2 || last[0] != 'v' {
+		return rawURL
+	}
+	for _, r := range last[1:] {
+		if r < '0' || r > '9' {
+			return rawURL
+		}
+	}
+	parts = parts[:len(parts)-1]
+	clone := *parsed
+	if len(parts) == 0 {
+		clone.Path = ""
+	} else {
+		clone.Path = "/" + strings.Join(parts, "/")
+	}
+	clone.RawQuery = ""
+	clone.Fragment = ""
+	return strings.TrimRight(clone.String(), "/")
+}
+
+func modelDiscoveryBaseVariants(base string) []string {
+	base = strings.TrimRight(strings.TrimSpace(base), "/")
+	if base == "" {
+		return nil
+	}
+
+	queue := []string{base}
+	seen := map[string]struct{}{}
+	var variants []string
+
+	for len(queue) > 0 {
+		current := strings.TrimRight(strings.TrimSpace(queue[0]), "/")
+		queue = queue[1:]
+		if current == "" {
+			continue
+		}
+		if _, ok := seen[current]; ok {
+			continue
+		}
+		seen[current] = struct{}{}
+		variants = append(variants, current)
+
+		if stripped := stripTrailingVersionSegment(current); stripped != current {
+			queue = append(queue, stripped)
+		}
+		for _, stripped := range strippedCompatibilityBases(current) {
+			queue = append(queue, stripped)
+		}
+	}
+
+	return variants
 }
 
 func strippedCompatibilityBases(rawURL string) []string {
