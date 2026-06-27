@@ -39,6 +39,7 @@ type normalizedContentPart struct {
 type messageTextParts struct {
 	reasoningParts []string
 	visibleParts   []string
+	visibleThink   thinkTextAccumulator
 }
 
 func (p *messageTextParts) addReasoning(text string) {
@@ -132,13 +133,9 @@ func (p *messageTextParts) collectVisible(value any) {
 	case nil:
 		return
 	case string:
-		reasoning, visible, found := splitThinkText(typed)
-		if found {
-			p.addReasoning(reasoning)
-			p.addVisible(visible)
-			return
-		}
-		p.addVisible(typed)
+		reasoning, visible := p.visibleThink.consume(typed)
+		p.addReasoning(reasoning)
+		p.addVisible(visible)
 	case []string:
 		for _, item := range typed {
 			p.addVisible(item)
@@ -175,6 +172,12 @@ func (p *messageTextParts) collectVisible(value any) {
 	default:
 		p.addVisible(stringValue(typed))
 	}
+}
+
+func (p *messageTextParts) finishVisibleThinking() {
+	reasoning, visible := p.visibleThink.finish()
+	p.addReasoning(reasoning)
+	p.addVisible(visible)
 }
 
 func newToolContext() *toolContext {
@@ -531,6 +534,7 @@ func extractReasoningAndMessage(message map[string]any) (reasoning, visible stri
 	parts.collectReasoning(message["reasoning"])
 	parts.collectReasoningDetails(message["reasoning_details"])
 	parts.collectVisible(message["content"])
+	parts.finishVisibleThinking()
 
 	return strings.Join(parts.reasoningParts, "\n"), strings.Join(parts.visibleParts, "")
 }
@@ -1233,6 +1237,7 @@ func buildOutputItem(message map[string]any, responseID, finishReason string, tc
 		}
 	case []any:
 		var textContent []any
+		var contentThink thinkTextAccumulator
 		for _, rawPart := range content {
 			part, ok := rawPart.(map[string]any)
 			if !ok {
@@ -1242,10 +1247,15 @@ func buildOutputItem(message map[string]any, responseID, finishReason string, tc
 			if isReasoningContentPartType(pt) {
 				continue
 			}
-			converted := convertOutputPartWithoutThinking(part)
+			converted := convertOutputPartWithoutThinking(part, &contentThink)
 			if converted != nil {
 				textContent = append(textContent, converted)
 			}
+		}
+		if _, visible := contentThink.finish(); visible != "" {
+			textContent = append(textContent, map[string]any{
+				"type": "output_text", "text": visible, "annotations": []any{},
+			})
 		}
 		outputItem["content"] = textContent
 	}
@@ -1253,8 +1263,8 @@ func buildOutputItem(message map[string]any, responseID, finishReason string, tc
 	return outputItem
 }
 
-func convertOutputPartWithoutThinking(part map[string]any) map[string]any {
-	if visible, ok := visibleOutputText(part); ok {
+func convertOutputPartWithoutThinking(part map[string]any, acc *thinkTextAccumulator) map[string]any {
+	if visible, ok := visibleOutputText(part, acc); ok {
 		if visible == "" {
 			return nil
 		}
@@ -1265,21 +1275,25 @@ func convertOutputPartWithoutThinking(part map[string]any) map[string]any {
 	return part
 }
 
-func visibleOutputText(part map[string]any) (string, bool) {
+func visibleOutputText(part map[string]any, acc *thinkTextAccumulator) (string, bool) {
 	for _, key := range []string{"text", "content", "output"} {
-		if visible, ok := splitThinkVisibleString(part[key]); ok {
+		if visible, ok := splitThinkVisibleString(part[key], acc); ok {
 			return visible, true
 		}
 	}
 	return "", false
 }
 
-func splitThinkVisibleString(value any) (string, bool) {
+func splitThinkVisibleString(value any, acc *thinkTextAccumulator) (string, bool) {
 	text := stringValue(value)
 	if text == "" {
 		return "", false
 	}
-	_, visible, _ := splitThinkText(text)
+	if acc == nil {
+		_, visible, _ := splitThinkText(text)
+		return visible, true
+	}
+	_, visible := acc.consume(text)
 	return visible, true
 }
 

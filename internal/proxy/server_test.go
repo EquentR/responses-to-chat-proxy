@@ -342,6 +342,66 @@ func TestModelsEndpointFailsClosedOnErrorPayloadWithEmptyData(t *testing.T) {
 	}
 }
 
+func TestModelsEndpointFailsClosedOnMixedValidAndMalformedCatalog(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{
+				"data": [
+					{
+						"id": "public-model",
+						"supported_endpoints": ["responses"]
+					},
+					{
+						"supported_endpoints": ["responses"],
+						"features": ["streaming"]
+					}
+				]
+			}`))
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer upstream.Close()
+
+	server := NewServer(Config{
+		UpstreamBaseURL: upstream.URL + "/v1",
+		ProxyAPIKey:     "proxy-secret",
+		UpstreamAPIKey:  "upstream-secret",
+		RequestTimeout:  secondsToDuration(5),
+		StreamTimeout:   secondsToDuration(5),
+		VerifySSL:       true,
+	})
+
+	identity := RouteIdentityKey(server.config.UpstreamBaseURL, server.config.UpstreamAPIKey)
+	server.routeTable.Store(identity, "legacy-model", RouteEntry{
+		ModelID:    "legacy-model",
+		Protocol:   RouteProtocolChat,
+		Endpoint:   "/v1/chat/completions",
+		Confidence: RouteConfidenceExplicit,
+	})
+
+	request := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	request.Header.Set("Authorization", "Bearer proxy-secret")
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("expected mixed catalog to fail closed, got %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	assertContains(t, strings.ToLower(recorder.Body.String()), "unrecognized")
+
+	if _, ok := server.routeTable.Resolve(identity, "legacy-model"); !ok {
+		t.Fatal("expected legacy route to remain after mixed catalog failure")
+	}
+	if _, ok := server.routeTable.Resolve(identity, "public-model"); ok {
+		t.Fatal("expected malformed catalog to avoid refreshing new routes")
+	}
+}
+
 func TestChatCompletionsStreamSynthesizesFinishReasonOnEOF(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")

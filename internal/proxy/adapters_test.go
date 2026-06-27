@@ -516,6 +516,85 @@ func TestConvertResponseStripsEmbeddedThinkBlocksFromTextAndOutputTextParts(t *t
 	}
 }
 
+func TestConvertResponseContentArraySharesThinkStateAcrossParts(t *testing.T) {
+	converted := ConvertResponse(map[string]any{
+		"id":      "chatcmpl-abc",
+		"created": 123,
+		"model":   "test-model",
+		"choices": []any{
+			map[string]any{
+				"finish_reason": "stop",
+				"message": map[string]any{
+					"role": "assistant",
+					"content": []any{
+						map[string]any{"type": "text", "text": "Intro <think>hidden"},
+						map[string]any{"type": "output_text", "text": "</think>\nAnswer"},
+					},
+				},
+			},
+		},
+	}, map[string]any{"model": "test-model", "input": "Hello"})
+
+	output := converted["output"].([]any)
+	if len(output) != 2 {
+		t.Fatalf("unexpected output length: %#v", output)
+	}
+
+	reasoning := output[0].(map[string]any)
+	summary := reasoning["summary"].([]any)
+	if got := summary[0].(map[string]any)["text"]; got != "hidden" {
+		t.Fatalf("unexpected reasoning summary: %v", got)
+	}
+
+	message := output[1].(map[string]any)
+	content := message["content"].([]any)
+	if len(content) != 2 {
+		t.Fatalf("unexpected content length: %#v", content)
+	}
+	if got := content[0].(map[string]any)["text"]; got != "Intro " {
+		t.Fatalf("unexpected visible text in first part: %v", got)
+	}
+	if got := content[1].(map[string]any)["text"]; got != "Answer" {
+		t.Fatalf("unexpected visible text in second part: %v", got)
+	}
+}
+
+func TestConvertResponseContentArrayPreservesIncompleteThinkPrefix(t *testing.T) {
+	converted := ConvertResponse(map[string]any{
+		"id":      "chatcmpl-abc",
+		"created": 123,
+		"model":   "test-model",
+		"choices": []any{
+			map[string]any{
+				"finish_reason": "stop",
+				"message": map[string]any{
+					"role": "assistant",
+					"content": []any{
+						map[string]any{"type": "output_text", "text": "Visible <thi"},
+					},
+				},
+			},
+		},
+	}, map[string]any{"model": "test-model", "input": "Hello"})
+
+	output := converted["output"].([]any)
+	if len(output) != 1 {
+		t.Fatalf("unexpected output length: %#v", output)
+	}
+
+	message := output[0].(map[string]any)
+	content := message["content"].([]any)
+	if len(content) != 2 {
+		t.Fatalf("unexpected content length: %#v", content)
+	}
+	if got := content[0].(map[string]any)["text"]; got != "Visible " {
+		t.Fatalf("unexpected first visible text: %v", got)
+	}
+	if got := content[1].(map[string]any)["text"]; got != "<thi" {
+		t.Fatalf("unexpected flushed visible text: %v", got)
+	}
+}
+
 func TestConvertResponseNormalizesGenericOutputPartsWithThinkTags(t *testing.T) {
 	converted := ConvertResponse(map[string]any{
 		"id":      "chatcmpl-abc",

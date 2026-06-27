@@ -54,12 +54,10 @@ func ParseModelDiscoveryResults(raw []byte) ([]ModelDiscoveryResult, error) {
 	results := make([]ModelDiscoveryResult, 0, len(items))
 	for _, item := range items {
 		result, ok := normalizeModelDiscoveryItem(item)
-		if ok {
-			results = append(results, result)
+		if !ok {
+			return nil, errUnrecognizedModelsCatalog
 		}
-	}
-	if len(items) > 0 && len(results) == 0 {
-		return nil, errUnrecognizedModelsCatalog
+		results = append(results, result)
 	}
 	return results, nil
 }
