@@ -1,0 +1,660 @@
+package proxy
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"sort"
+	"strings"
+)
+
+const maxModelsResponseBytes = 4 << 20
+
+type ModelDiscoveryResult struct {
+	ModelID            string
+	Protocol           RouteProtocol
+	ProtocolCandidates []RouteProtocol
+	Endpoint           string
+	Features           []string
+	Confidence         RouteConfidence
+	Reasoning          string
+	Raw                map[string]any
+}
+
+func DiscoverModels(ctx context.Context, client *http.Client, cfg Config) ([]ModelDiscoveryResult, error) {
+	if client == nil {
+		client = http.DefaultClient
+	}
+
+	page, err := fetchModelDiscoveryPage(ctx, client, cfg, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	results, err := ParseModelDiscoveryResults(page.Body)
+	if err != nil {
+		return nil, err
+	}
+	return results, nil
+}
+
+func ParseModelDiscoveryResults(raw []byte) ([]ModelDiscoveryResult, error) {
+	var payload any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, fmt.Errorf("models discovery returned invalid JSON: %w", err)
+	}
+
+	items := extractModelItems(payload)
+	results := make([]ModelDiscoveryResult, 0, len(items))
+	for _, item := range items {
+		result, ok := normalizeModelDiscoveryItem(item)
+		if ok {
+			results = append(results, result)
+		}
+	}
+	return results, nil
+}
+
+type modelDiscoveryPage struct {
+	Body        []byte
+	StatusCode  int
+	ContentType string
+}
+
+type modelDiscoveryError struct {
+	statusCode int
+	message    string
+}
+
+func (e *modelDiscoveryError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return e.message
+}
+
+func fetchModelDiscoveryPage(ctx context.Context, client *http.Client, cfg Config, incoming http.Header) (modelDiscoveryPage, error) {
+	candidates := modelDiscoveryCandidates(cfg.UpstreamBaseURL, cfg.UpstreamModelsURL)
+	if len(candidates) == 0 {
+		return modelDiscoveryPage{}, errors.New("models discovery has no endpoint candidates")
+	}
+
+	var lastErr error
+	for _, candidate := range candidates {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, candidate, nil)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		req.Header = copyHeaders(incoming, cfg.UpstreamAPIKey)
+		req.Header.Set("Accept", "application/json")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return modelDiscoveryPage{}, fmt.Errorf("models discovery failed: %w", err)
+		}
+
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxModelsResponseBytes))
+		contentType := resp.Header.Get("Content-Type")
+		_ = resp.Body.Close()
+		if readErr != nil {
+			return modelDiscoveryPage{}, fmt.Errorf("models discovery failed reading upstream response: %w", readErr)
+		}
+
+		if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed {
+			lastErr = fmt.Errorf("models discovery candidate returned HTTP %d", resp.StatusCode)
+			continue
+		}
+		if resp.StatusCode >= http.StatusBadRequest {
+			return modelDiscoveryPage{}, &modelDiscoveryError{
+				statusCode: resp.StatusCode,
+				message:    sanitizedModelsDiscoveryError(resp.StatusCode).Error(),
+			}
+		}
+
+		return modelDiscoveryPage{
+			Body:        body,
+			StatusCode:  resp.StatusCode,
+			ContentType: contentType,
+		}, nil
+	}
+
+	if lastErr != nil {
+		return modelDiscoveryPage{}, lastErr
+	}
+	return modelDiscoveryPage{}, errors.New("models discovery failed")
+}
+
+func ApplyDiscoveredModels(table *RouteTable, identity RouteIdentity, results []ModelDiscoveryResult) {
+	if table == nil {
+		return
+	}
+	for _, result := range results {
+		if result.ModelID == "" || result.Protocol == RouteProtocolUnknown {
+			continue
+		}
+
+		table.Store(identity, result.ModelID, RouteEntry{
+			ModelID:    result.ModelID,
+			Protocol:   result.Protocol,
+			Endpoint:   result.Endpoint,
+			Confidence: result.Confidence,
+			Features:   result.Features,
+			Reasoning:  result.Reasoning,
+		})
+	}
+}
+
+func (s *Server) initializeStartupDiscovery(ctx context.Context) error {
+	if s == nil || s.config.RouteDetection != RouteDetectionStartup {
+		return nil
+	}
+
+	page, err := fetchModelDiscoveryPage(ctx, s.normalClient, s.config, nil)
+	if err != nil {
+		return err
+	}
+
+	results, err := ParseModelDiscoveryResults(page.Body)
+	if err != nil {
+		return err
+	}
+
+	ApplyDiscoveredModels(s.routeTable, RouteIdentityKey(s.config.UpstreamBaseURL, s.config.UpstreamAPIKey), results)
+	return nil
+}
+
+func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
+	page, err := fetchModelDiscoveryPage(r.Context(), s.normalClient, s.config, r.Header)
+	if err != nil {
+		writeDiscoveryError(w, err)
+		return
+	}
+
+	if results, parseErr := ParseModelDiscoveryResults(page.Body); parseErr == nil {
+		ApplyDiscoveredModels(s.routeTable, RouteIdentityKey(s.config.UpstreamBaseURL, s.config.UpstreamAPIKey), results)
+	}
+
+	contentType := page.ContentType
+	if contentType == "" {
+		contentType = "application/json"
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.WriteHeader(page.StatusCode)
+	_, _ = w.Write(page.Body)
+}
+
+func modelDiscoveryCandidates(baseURL, explicitModelsURL string) []string {
+	var candidates []string
+	if explicit := strings.TrimSpace(explicitModelsURL); explicit != "" {
+		candidates = appendUniqueString(candidates, strings.TrimRight(explicit, "/"))
+	}
+
+	base := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if base == "" {
+		return candidates
+	}
+
+	if hasVersionPathSuffix(base) {
+		candidates = appendUniqueString(candidates, base+"/models")
+	} else {
+		candidates = appendUniqueString(candidates, base+"/v1/models")
+	}
+
+	for _, stripped := range strippedCompatibilityBases(base) {
+		candidates = appendUniqueString(candidates, stripped+"/v1/models")
+		candidates = appendUniqueString(candidates, stripped+"/models")
+	}
+
+	return candidates
+}
+
+func extractModelItems(payload any) []map[string]any {
+	switch typed := payload.(type) {
+	case []any:
+		return mapsFromSlice(typed)
+	case map[string]any:
+		for _, key := range []string{"data", "models", "items", "results", "result"} {
+			switch values := typed[key].(type) {
+			case []any:
+				return mapsFromSlice(values)
+			case map[string]any:
+				if looksLikeModelMetadata(values) {
+					return []map[string]any{values}
+				}
+			}
+		}
+		if looksLikeModelMetadata(typed) {
+			return []map[string]any{typed}
+		}
+	}
+	return nil
+}
+
+func normalizeModelDiscoveryItem(raw map[string]any) (ModelDiscoveryResult, bool) {
+	modelID := firstString(raw, "id", "model", "name", "model_id")
+	if modelID == "" {
+		return ModelDiscoveryResult{}, false
+	}
+
+	explicitProtocol := firstString(raw, "protocol", "route_protocol", "api_protocol")
+	explicitProtocolValue := normalizeRouteProtocol(explicitProtocol)
+	explicitEndpointRaw := firstString(raw, "endpoint", "endpoint_url", "path")
+	explicitEndpoint := normalizeModelEndpoint(explicitEndpointRaw)
+
+	endpointSignals := collectEndpointSignals(raw)
+	protocolCandidates := make([]RouteProtocol, 0, 3)
+	reasonNotes := make([]string, 0, 4)
+	confidence := RouteConfidenceFallback
+
+	protocol := RouteProtocolUnknown
+	if explicitProtocolValue != RouteProtocolUnknown {
+		protocol = explicitProtocolValue
+		protocolCandidates = appendUniqueRouteProtocol(protocolCandidates, protocol)
+		reasonNotes = append(reasonNotes, "protocol declared in metadata")
+		confidence = RouteConfidenceExplicit
+	}
+
+	if explicitEndpointRaw != "" {
+		if inferred := inferProtocolFromSignals(explicitEndpointRaw, nil); inferred != RouteProtocolUnknown {
+			protocolCandidates = appendUniqueRouteProtocol(protocolCandidates, inferred)
+			if protocol == RouteProtocolUnknown {
+				protocol = inferred
+			}
+		}
+		reasonNotes = append(reasonNotes, "endpoint declared in metadata")
+		confidence = RouteConfidenceExplicit
+	}
+
+	if protocol == RouteProtocolUnknown {
+		if inferred := inferProtocolFromSignals("", endpointSignals); inferred != RouteProtocolUnknown {
+			protocol = inferred
+			protocolCandidates = appendUniqueRouteProtocol(protocolCandidates, inferred)
+			reasonNotes = append(reasonNotes, "protocol inferred from models metadata")
+			confidence = RouteConfidenceModelsMetadata
+		}
+	}
+
+	endpoint := explicitEndpoint
+	if endpoint == "" && protocol != RouteProtocolUnknown {
+		endpoint = defaultEndpointForProtocol(protocol)
+		if confidence == RouteConfidenceFallback {
+			confidence = RouteConfidenceModelsMetadata
+		}
+	}
+
+	if protocol == RouteProtocolUnknown && endpoint != "" {
+		if inferred := inferProtocolFromSignals(endpoint, nil); inferred != RouteProtocolUnknown {
+			protocol = inferred
+			protocolCandidates = appendUniqueRouteProtocol(protocolCandidates, inferred)
+			reasonNotes = append(reasonNotes, "endpoint path implies protocol")
+			if confidence == RouteConfidenceFallback {
+				confidence = RouteConfidenceExplicit
+			}
+		}
+	}
+
+	features := collectModelFeatures(raw)
+	reasoning := firstString(raw, "reasoning", "notes", "description")
+	if reasoning == "" {
+		reasoning = strings.Join(reasonNotes, "; ")
+	}
+	if reasoning == "" && protocol != RouteProtocolUnknown {
+		reasoning = "loaded from models metadata"
+	}
+	if confidence == RouteConfidenceFallback && protocol != RouteProtocolUnknown {
+		confidence = RouteConfidenceModelsMetadata
+	}
+
+	return ModelDiscoveryResult{
+		ModelID:            modelID,
+		Protocol:           protocol,
+		ProtocolCandidates: protocolCandidates,
+		Endpoint:           endpoint,
+		Features:           features,
+		Confidence:         confidence,
+		Reasoning:          reasoning,
+		Raw:                cloneAnyMap(raw),
+	}, true
+}
+
+func collectEndpointSignals(raw map[string]any) []string {
+	var signals []string
+	for _, key := range []string{"supported_endpoints", "endpoints", "routes", "apis", "protocols", "capabilities"} {
+		signals = append(signals, stringsFromAny(raw[key])...)
+		if key == "capabilities" {
+			signals = append(signals, featureStringsFromAny(raw[key])...)
+		}
+	}
+	return dedupeStringsPreserveOrder(signals)
+}
+
+func collectModelFeatures(raw map[string]any) []string {
+	var features []string
+	for _, key := range []string{"features", "capabilities", "modalities", "input_modalities", "output_modalities"} {
+		features = append(features, featureStringsFromAny(raw[key])...)
+	}
+	return dedupeSortedStrings(features)
+}
+
+func featureStringsFromAny(value any) []string {
+	switch typed := value.(type) {
+	case map[string]any:
+		var values []string
+		keys := make([]string, 0, len(typed))
+		for key := range typed {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			value := typed[key]
+			if boolValue(value) {
+				values = append(values, normalizeFeatureName(key))
+			}
+		}
+		return values
+	default:
+		return stringsFromAny(value)
+	}
+}
+
+func stringsFromAny(value any) []string {
+	switch typed := value.(type) {
+	case nil:
+		return nil
+	case string:
+		if value := normalizeFeatureName(typed); value != "" {
+			return []string{value}
+		}
+	case []any:
+		var values []string
+		for _, item := range typed {
+			values = append(values, stringsFromAny(item)...)
+		}
+		return values
+	case []string:
+		values := make([]string, 0, len(typed))
+		for _, item := range typed {
+			if value := normalizeFeatureName(item); value != "" {
+				values = append(values, value)
+			}
+		}
+		return values
+	case map[string]any:
+		for _, key := range []string{"path", "endpoint", "url", "protocol", "type", "name"} {
+			if value := normalizeFeatureName(stringValue(typed[key])); value != "" {
+				return []string{value}
+			}
+		}
+	}
+	return nil
+}
+
+func inferProtocolFromSignals(endpoint string, signals []string) RouteProtocol {
+	allSignals := append([]string{endpoint}, signals...)
+	for _, signal := range allSignals {
+		normalized := strings.ToLower(strings.TrimSpace(signal))
+		normalized = strings.Trim(normalized, "/")
+		switch {
+		case normalized == "responses" || strings.Contains(normalized, "responses"):
+			return RouteProtocolResponses
+		case normalized == "chat" || strings.Contains(normalized, "chat/completions") || strings.Contains(normalized, "chat-completions"):
+			return RouteProtocolChat
+		case normalized == "messages" || strings.Contains(normalized, "messages"):
+			return RouteProtocolMessages
+		}
+	}
+	return RouteProtocolUnknown
+}
+
+func normalizeRouteProtocol(value string) RouteProtocol {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "responses", "response":
+		return RouteProtocolResponses
+	case "chat", "chat_completions", "chat-completions", "chat/completions":
+		return RouteProtocolChat
+	case "messages", "anthropic":
+		return RouteProtocolMessages
+	default:
+		return RouteProtocolUnknown
+	}
+}
+
+func defaultEndpointForProtocol(protocol RouteProtocol) string {
+	switch protocol {
+	case RouteProtocolResponses:
+		return "/v1/responses"
+	case RouteProtocolChat:
+		return "/v1/chat/completions"
+	case RouteProtocolMessages:
+		return "/v1/messages"
+	default:
+		return ""
+	}
+}
+
+func normalizeModelEndpoint(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if strings.HasPrefix(value, "http://") || strings.HasPrefix(value, "https://") {
+		parsed, err := url.Parse(value)
+		if err == nil {
+			value = parsed.Path
+		}
+	}
+	if !strings.HasPrefix(value, "/") {
+		value = "/" + value
+	}
+	if strings.HasPrefix(value, "/v1/") || value == "/v1" {
+		return value
+	}
+	if strings.HasPrefix(value, "/v") && len(value) > 2 && value[2] >= '0' && value[2] <= '9' {
+		return value
+	}
+	return "/v1" + value
+}
+
+func sanitizedModelsDiscoveryError(statusCode int) error {
+	switch statusCode {
+	case http.StatusUnauthorized:
+		return errors.New("models discovery failed: upstream authentication rejected the request")
+	case http.StatusForbidden:
+		return errors.New("models discovery failed: upstream authorization rejected the request")
+	case http.StatusTooManyRequests:
+		return errors.New("models discovery failed: upstream rate limited the request")
+	default:
+		if statusCode >= http.StatusInternalServerError {
+			return fmt.Errorf("models discovery failed: upstream returned HTTP %d", statusCode)
+		}
+		return fmt.Errorf("models discovery failed: upstream returned HTTP %d", statusCode)
+	}
+}
+
+func writeDiscoveryError(w http.ResponseWriter, err error) {
+	if err == nil {
+		return
+	}
+
+	statusCode := http.StatusBadGateway
+	message := "Models discovery failed."
+
+	var discoveryErr *modelDiscoveryError
+	if errors.As(err, &discoveryErr) {
+		statusCode = discoveryErr.statusCode
+		message = discoveryErr.message
+	} else if errors.Is(err, context.DeadlineExceeded) {
+		statusCode = http.StatusGatewayTimeout
+		message = "Models discovery timed out."
+	} else {
+		message = trimMessage(err.Error())
+	}
+
+	writeJSON(w, statusCode, errorPayload(message, "upstream_error", fmt.Sprintf("http_%d", statusCode)))
+}
+
+func mapsFromSlice(values []any) []map[string]any {
+	items := make([]map[string]any, 0, len(values))
+	for _, value := range values {
+		if item, ok := value.(map[string]any); ok {
+			items = append(items, item)
+		}
+	}
+	return items
+}
+
+func looksLikeModelMetadata(value map[string]any) bool {
+	for _, key := range []string{"id", "model", "name", "model_id"} {
+		if stringValue(value[key]) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func hasVersionPathSuffix(rawURL string) bool {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+	if len(parts) == 0 {
+		return false
+	}
+	last := parts[len(parts)-1]
+	if len(last) < 2 || last[0] != 'v' {
+		return false
+	}
+	for _, r := range last[1:] {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func strippedCompatibilityBases(rawURL string) []string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return nil
+	}
+	parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+	if len(parts) == 0 || parts[0] == "" {
+		return nil
+	}
+
+	suffixes := map[string]struct{}{
+		"anthropic": {},
+		"messages":  {},
+		"chat":      {},
+		"coding":    {},
+		"claude":    {},
+	}
+
+	var bases []string
+	for len(parts) > 0 {
+		last := strings.ToLower(parts[len(parts)-1])
+		if _, ok := suffixes[last]; !ok {
+			break
+		}
+		parts = parts[:len(parts)-1]
+		clone := *parsed
+		clone.Path = "/" + strings.Join(parts, "/")
+		clone.RawQuery = ""
+		clone.Fragment = ""
+		bases = append(bases, strings.TrimRight(clone.String(), "/"))
+	}
+	return bases
+}
+
+func firstString(values map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value := strings.TrimSpace(stringValue(values[key])); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func appendUniqueString(values []string, value string) []string {
+	if value == "" {
+		return values
+	}
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
+	}
+	return append(values, value)
+}
+
+func normalizeFeatureName(value string) string {
+	return strings.Trim(strings.ToLower(strings.TrimSpace(value)), "/")
+}
+
+func dedupeSortedStrings(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	for _, value := range values {
+		value = normalizeFeatureName(value)
+		if value != "" {
+			seen[value] = struct{}{}
+		}
+	}
+	result := make([]string, 0, len(seen))
+	for value := range seen {
+		result = append(result, value)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func dedupeStringsPreserveOrder(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		value = normalizeFeatureName(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result
+}
+
+func appendUniqueRouteProtocol(values []RouteProtocol, value RouteProtocol) []RouteProtocol {
+	if value == RouteProtocolUnknown {
+		return values
+	}
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
+	}
+	return append(values, value)
+}
+
+func cloneAnyMap(source map[string]any) map[string]any {
+	if len(source) == 0 {
+		return nil
+	}
+	clone := make(map[string]any, len(source))
+	for key, value := range source {
+		clone[key] = value
+	}
+	return clone
+}

@@ -16,6 +16,7 @@ import (
 
 type Server struct {
 	config       Config
+	routeTable   *RouteTable
 	normalClient *http.Client
 	streamClient *http.Client
 }
@@ -25,7 +26,8 @@ func NewServer(cfg Config) *Server {
 	transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: !cfg.VerifySSL}
 
 	return &Server{
-		config: cfg,
+		config:     cfg,
+		routeTable: NewRouteTable(cfg.RouteTableTTL),
 		normalClient: &http.Client{
 			Timeout:   cfg.RequestTimeout,
 			Transport: transport,
@@ -37,20 +39,27 @@ func NewServer(cfg Config) *Server {
 }
 
 func Run(cfg Config) error {
-	server := &http.Server{
+	proxyServer := NewServer(cfg)
+	if err := proxyServer.initializeStartupDiscovery(context.Background()); err != nil {
+		log.Printf("models discovery at startup failed: %v", err)
+	}
+
+	httpServer := &http.Server{
 		Addr:              fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
-		Handler:           NewServer(cfg),
+		Handler:           proxyServer,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	log.Printf("listening on %s", server.Addr)
-	return server.ListenAndServe()
+	log.Printf("listening on %s", httpServer.Addr)
+	return httpServer.ListenAndServe()
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == "/health":
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+	case r.Method == http.MethodGet && r.URL.Path == "/v1/models":
+		s.handleModels(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/responses":
 		s.handleResponses(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions":
