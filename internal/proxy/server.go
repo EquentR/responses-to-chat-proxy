@@ -60,12 +60,20 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/models":
 		s.handleModels(w, r)
+	case r.URL.Path == "/v1/chat/completions":
+		if r.Method != http.MethodPost {
+			s.writeMethodNotAllowed(w, http.MethodPost)
+			return
+		}
+		s.handleChatCompletions(w, r)
+	case r.URL.Path == "/v1/messages":
+		if r.Method != http.MethodPost {
+			s.writeMethodNotAllowed(w, http.MethodPost)
+			return
+		}
+		s.handleMessages(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/responses":
 		s.handleResponses(w, r)
-	case r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions":
-		s.handleChatCompletions(w, r)
-	case r.Method == http.MethodPost && r.URL.Path == "/v1/messages":
-		s.handleMessages(w, r)
 	case strings.HasPrefix(r.URL.Path, "/v1/"):
 		s.forwardUnknownV1(w, r)
 	default:
@@ -186,7 +194,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	endpointURL := s.routeEndpointURL(route, RouteProtocolMessages)
-	if _, hasStream := body["stream"]; hasStream {
+	if boolValue(body["stream"]) {
 		s.passthroughStream(w, r, body, endpointURL, RouteProtocolMessages)
 		return
 	}
@@ -518,6 +526,11 @@ func joinUpstreamEndpoint(baseURL, endpoint string) string {
 
 func (s *Server) writeUnsupportedProtocol(w http.ResponseWriter, message string) {
 	writeJSON(w, http.StatusBadRequest, errorPayload(message, "invalid_request_error", "unsupported_protocol"))
+}
+
+func (s *Server) writeMethodNotAllowed(w http.ResponseWriter, allowed string) {
+	w.Header().Set("Allow", allowed)
+	writeJSON(w, http.StatusMethodNotAllowed, errorPayload("Method not allowed.", "invalid_request_error", "method_not_allowed"))
 }
 
 func writeMissingModel(w http.ResponseWriter) {
