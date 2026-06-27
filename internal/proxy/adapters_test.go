@@ -516,6 +516,89 @@ func TestConvertResponseStripsEmbeddedThinkBlocksFromTextAndOutputTextParts(t *t
 	}
 }
 
+func TestConvertResponseNormalizesOutputTextPartsAndTrimsThinkSeparatorWhitespace(t *testing.T) {
+	tests := []struct {
+		name          string
+		text          string
+		wantReasoning string
+		wantVisible   string
+	}{
+		{
+			name:          "think-newline",
+			text:          "<think>Hidden</think>\nAnswer",
+			wantReasoning: "Hidden",
+			wantVisible:   "Answer",
+		},
+		{
+			name:          "thinking-spaces",
+			text:          "<thinking>Hidden</thinking>  Answer",
+			wantReasoning: "Hidden",
+			wantVisible:   "Answer",
+		},
+		{
+			name:        "plain-output-text",
+			text:        "Plain answer",
+			wantVisible: "Plain answer",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			converted := ConvertResponse(map[string]any{
+				"id":      "chatcmpl-abc",
+				"created": 123,
+				"model":   "test-model",
+				"choices": []any{
+					map[string]any{
+						"finish_reason": "stop",
+						"message": map[string]any{
+							"role": "assistant",
+							"content": []any{
+								map[string]any{
+									"type":        "output_text",
+									"text":        tt.text,
+									"annotations": []any{},
+									"marker":      "raw",
+								},
+							},
+						},
+					},
+				},
+			}, map[string]any{"model": "test-model", "input": "Hello"})
+
+			output := converted["output"].([]any)
+			if tt.wantReasoning == "" {
+				if len(output) != 1 {
+					t.Fatalf("unexpected output length: %#v", output)
+				}
+			} else {
+				if len(output) != 2 {
+					t.Fatalf("unexpected output length: %#v", output)
+				}
+				reasoning := output[0].(map[string]any)
+				summary := reasoning["summary"].([]any)
+				if got := summary[0].(map[string]any)["text"]; got != tt.wantReasoning {
+					t.Fatalf("unexpected reasoning summary: %v", got)
+				}
+			}
+
+			messageIndex := len(output) - 1
+			message := output[messageIndex].(map[string]any)
+			content := message["content"].([]any)
+			if len(content) != 1 {
+				t.Fatalf("unexpected content length: %#v", content)
+			}
+			part := content[0].(map[string]any)
+			if got := part["text"]; got != tt.wantVisible {
+				t.Fatalf("unexpected visible text: %v", got)
+			}
+			if _, ok := part["marker"]; ok {
+				t.Fatalf("output_text part should not be passed through raw: %#v", part)
+			}
+		})
+	}
+}
+
 func TestConvertResponseThinkOnlyContentStaysInvisible(t *testing.T) {
 	stringCase := ConvertResponse(map[string]any{
 		"id":      "chatcmpl-abc",
@@ -729,6 +812,167 @@ func TestStreamingConverterStripsSplitThinkBlocksAcrossChunks(t *testing.T) {
 	content := message["content"].([]any)
 	if got := content[0].(map[string]any)["text"]; got != "beforeafter" {
 		t.Fatalf("unexpected visible text: %v", got)
+	}
+}
+
+func TestStreamingConverterTrimsSeparatorWhitespaceAfterThinkClose(t *testing.T) {
+	tests := []struct {
+		name        string
+		content     string
+		wantVisible string
+	}{
+		{
+			name:        "think-newline",
+			content:     "<think>Hidden</think>\nAnswer",
+			wantVisible: "Answer",
+		},
+		{
+			name:        "thinking-spaces",
+			content:     "<thinking>Hidden</thinking>  Answer",
+			wantVisible: "Answer",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			converter := NewStreamingConverter()
+			chunk := "data: " + mustJSON(map[string]any{
+				"id":      "chatcmpl-abc",
+				"created": 123,
+				"model":   "test-model",
+				"choices": []any{
+					map[string]any{
+						"delta":         map[string]any{"role": "assistant", "content": tt.content},
+						"finish_reason": nil,
+					},
+				},
+			}) + "\n\n" + "data: " + mustJSON(map[string]any{
+				"id":      "chatcmpl-abc",
+				"created": 123,
+				"model":   "test-model",
+				"choices": []any{
+					map[string]any{
+						"delta":         map[string]any{},
+						"finish_reason": "stop",
+					},
+				},
+			}) + "\n\n"
+
+			payloads := ssePayloads(converter.Feed([]byte(chunk)))
+			var seenDelta string
+			for _, payload := range payloads {
+				if payload["type"] == "response.output_text.delta" {
+					seenDelta = stringValue(payload["delta"])
+				}
+			}
+			if seenDelta != tt.wantVisible {
+				t.Fatalf("unexpected visible delta: %q", seenDelta)
+			}
+
+			completed := findPayload(payloads, "response.completed")
+			if completed == nil {
+				t.Fatalf("missing response.completed payloads=%#v", payloads)
+			}
+			response := completed["response"].(map[string]any)
+			output := response["output"].([]any)
+			if len(output) != 2 {
+				t.Fatalf("unexpected output count: %#v", output)
+			}
+			message := output[1].(map[string]any)
+			content := message["content"].([]any)
+			if got := content[0].(map[string]any)["text"]; got != tt.wantVisible {
+				t.Fatalf("unexpected completed visible text: %v", got)
+			}
+		})
+	}
+}
+
+func TestStreamingConverterOrdersFinalDoneEventsAndCompletedOutputByOutputIndex(t *testing.T) {
+	converter := NewStreamingConverter()
+	chunk := "data: " + mustJSON(map[string]any{
+		"id":      "chatcmpl-abc",
+		"created": 123,
+		"model":   "test-model",
+		"choices": []any{
+			map[string]any{
+				"delta":         map[string]any{"role": "assistant", "content": "Visible answer."},
+				"finish_reason": nil,
+			},
+		},
+	}) + "\n\n" + "data: " + mustJSON(map[string]any{
+		"id":      "chatcmpl-abc",
+		"created": 123,
+		"model":   "test-model",
+		"choices": []any{
+			map[string]any{
+				"delta": map[string]any{
+					"tool_calls": []any{
+						map[string]any{
+							"index": 0,
+							"id":    "call_abc",
+							"type":  "function",
+							"function": map[string]any{
+								"name":      "shell",
+								"arguments": `{"command":"ls"}`,
+							},
+						},
+					},
+				},
+				"finish_reason": nil,
+			},
+		},
+	}) + "\n\n" + "data: " + mustJSON(map[string]any{
+		"id":      "chatcmpl-abc",
+		"created": 123,
+		"model":   "test-model",
+		"choices": []any{
+			map[string]any{
+				"delta":         map[string]any{"reasoning_content": "Hidden thought."},
+				"finish_reason": nil,
+			},
+		},
+	}) + "\n\n" + "data: " + mustJSON(map[string]any{
+		"id":      "chatcmpl-abc",
+		"created": 123,
+		"model":   "test-model",
+		"choices": []any{
+			map[string]any{"delta": map[string]any{}, "finish_reason": "tool_calls"},
+		},
+	}) + "\n\n"
+
+	payloads := ssePayloads(converter.Feed([]byte(chunk)))
+	var doneIndexes []int
+	for _, payload := range payloads {
+		typ := stringValue(payload["type"])
+		if len(typ) >= 5 && typ[len(typ)-5:] == ".done" {
+			doneIndexes = append(doneIndexes, intValue(payload["output_index"]))
+		}
+	}
+	wantDoneIndexes := []int{0, 0, 0, 1, 1, 2, 2}
+	if len(doneIndexes) != len(wantDoneIndexes) {
+		t.Fatalf("unexpected done index count: got %v want %v", doneIndexes, wantDoneIndexes)
+	}
+	for i, want := range wantDoneIndexes {
+		if doneIndexes[i] != want {
+			t.Fatalf("unexpected done event order: got %v want %v", doneIndexes, wantDoneIndexes)
+		}
+	}
+
+	completed := findPayload(payloads, "response.completed")
+	if completed == nil {
+		t.Fatalf("missing response.completed payloads=%#v", payloads)
+	}
+	response := completed["response"].(map[string]any)
+	output := response["output"].([]any)
+	if len(output) != 3 {
+		t.Fatalf("unexpected output count: %#v", output)
+	}
+	wantTypes := []string{"message", "function_call", "reasoning"}
+	for i, want := range wantTypes {
+		item := output[i].(map[string]any)
+		if got := stringValue(item["type"]); got != want {
+			t.Fatalf("unexpected output order at %d: got %q want %q (output=%#v)", i, got, want, output)
+		}
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"unicode"
 )
 
 // ---------------------------------------------------------------------------
@@ -558,10 +559,11 @@ func finalizeOutputItems(output []any, responseStatus string) []any {
 }
 
 type thinkTextAccumulator struct {
-	insideThink   bool
-	expectedClose string
-	carry         string
-	foundTag      bool
+	insideThink                  bool
+	expectedClose                string
+	carry                        string
+	foundTag                     bool
+	skipLeadingVisibleWhitespace bool
 }
 
 var thinkOpenTags = []string{"<think>", "<thinking>"}
@@ -584,6 +586,14 @@ func (a *thinkTextAccumulator) consume(text string) (reasoning, visible string) 
 	var reasoningParts, visibleParts strings.Builder
 
 	for len(buf) > 0 {
+		if a.skipLeadingVisibleWhitespace && !a.insideThink {
+			buf = strings.TrimLeftFunc(buf, unicode.IsSpace)
+			if buf == "" {
+				break
+			}
+			a.skipLeadingVisibleWhitespace = false
+		}
+
 		if !a.insideThink {
 			idx, tag := findThinkTag(buf, thinkOpenTags)
 			if idx >= 0 {
@@ -618,6 +628,7 @@ func (a *thinkTextAccumulator) consume(text string) (reasoning, visible string) 
 			a.insideThink = false
 			a.expectedClose = ""
 			a.foundTag = true
+			a.skipLeadingVisibleWhitespace = true
 			continue
 		}
 
@@ -1246,7 +1257,7 @@ func convertOutputPartWithoutThinking(part map[string]any) map[string]any {
 	switch stringValue(part["type"]) {
 	case "text", "output_text":
 		_, visible, found := splitThinkText(stringValue(part["text"]))
-		if found {
+		if found || stringValue(part["type"]) == "text" {
 			if visible == "" {
 				return nil
 			}
@@ -1254,15 +1265,12 @@ func convertOutputPartWithoutThinking(part map[string]any) map[string]any {
 				"type": "output_text", "text": visible, "annotations": []any{},
 			}
 		}
-		if stringValue(part["type"]) == "text" {
-			if visible == "" {
-				return nil
-			}
-			return map[string]any{
-				"type": "output_text", "text": visible, "annotations": []any{},
-			}
+		if visible == "" {
+			return nil
 		}
-		return part
+		return map[string]any{
+			"type": "output_text", "text": visible, "annotations": []any{},
+		}
 	default:
 		return part
 	}
@@ -1763,6 +1771,13 @@ func NewStreamingConverter() *StreamingConverter {
 	}
 }
 
+type finalStreamingOutputItem struct {
+	outputIndex int
+	addedEvent  string
+	doneEvents  []string
+	output      map[string]any
+}
+
 func (c *StreamingConverter) Feed(chunk []byte) []string {
 	c.sseBuffer += strings.ReplaceAll(strings.ReplaceAll(string(chunk), "\r\n", "\n"), "\r", "\n")
 	var events []string
@@ -2091,105 +2106,17 @@ func (c *StreamingConverter) processToolCallDelta(toolCall map[string]any) []str
 }
 
 func (c *StreamingConverter) finishOutputItems() []string {
-	var events []string
-	if !c.outputItemDone {
-		c.outputItemDone = true
-		events = append(events, c.flushThinkContent()...)
-		events = append(events, c.finishReasoningEvents()...)
-		events = append(events, c.finishTextEvents()...)
-		if c.outputItemAdded {
-			var content []any
-			if c.contentPartAdded {
-				content = append(content, map[string]any{
-					"type": "output_text", "text": c.fullText, "annotations": []any{},
-				})
-			}
-			events = append(events, sseEvent("response.output_item.done", map[string]any{
-				"output_index": c.messageOutputIndexValue(),
-				"item": map[string]any{
-					"type": "message", "id": c.messageID, "status": "completed",
-					"role": c.messageRole, "content": content,
-				},
-			}))
-		}
-	}
-	events = append(events, c.finishToolEvents()...)
-	return events
-}
-
-func (c *StreamingConverter) finishReasoningEvents() []string {
-	if !c.reasoningDone || c.reasoningText == "" {
+	if c.outputItemDone {
 		return nil
 	}
-	return []string{
-		sseEvent("response.reasoning_text.done", map[string]any{
-			"item_id": c.reasoningItemID(), "output_index": c.reasoningOutputIndexValue(), "content_index": 0,
-			"text": c.reasoningText,
-		}),
-		sseEvent("response.output_item.done", map[string]any{
-			"output_index": c.reasoningOutputIndexValue(),
-			"item": map[string]any{
-				"type": "reasoning", "id": c.reasoningItemID(), "status": "completed",
-				"summary": []any{
-					map[string]any{"type": "summary_text", "text": c.reasoningText},
-				},
-			},
-		}),
-	}
-}
+	c.outputItemDone = true
 
-func (c *StreamingConverter) finishTextEvents() []string {
-	if !c.contentPartAdded || c.textDone {
-		return nil
-	}
-	c.textDone = true
-	return []string{
-		sseEvent("response.output_text.done", map[string]any{
-			"item_id": c.messageID, "output_index": c.messageOutputIndexValue(),
-			"content_index": 0, "text": c.fullText,
-		}),
-		sseEvent("response.content_part.done", map[string]any{
-			"item_id": c.messageID, "output_index": c.messageOutputIndexValue(),
-			"content_index": 0,
-			"part": map[string]any{
-				"type": "output_text", "text": c.fullText, "annotations": []any{},
-			},
-		}),
-	}
-}
-
-func (c *StreamingConverter) finishToolEvents() []string {
-	var events []string
-	indexes := sortedToolIndexes(c.toolCalls)
-	for _, index := range indexes {
-		tc := c.toolCalls[index]
-		if tc.OutputIndex == nil {
-			continue
+	events := c.flushThinkContent()
+	for _, item := range c.orderedFinalOutputItems() {
+		if item.addedEvent != "" {
+			events = append(events, item.addedEvent)
 		}
-		tc.spec = normalizeStreamToolCall(tc.Name, tc.Arguments)
-		if tc.spec.kind == streamToolCallKindUnknown {
-			tc.spec = streamToolCallSpecFromArguments(tc.Name, tc.Arguments)
-		}
-		if tc.ItemID == "" {
-			tc.ItemID = c.toolItemIDForSpec(tc.spec, tc.ID, index)
-		}
-		if !tc.Added {
-			tc.Added = true
-			events = append(events, sseEvent("response.output_item.added", map[string]any{
-				"output_index": *tc.OutputIndex,
-				"item":         renderStreamToolCallItem(tc.spec, tc.ItemID, tc.ID, tc.Arguments, "in_progress"),
-			}))
-		}
-		events = append(events,
-			sseEvent("response.function_call_arguments.done", map[string]any{
-				"item_id": tc.ItemID, "output_index": *tc.OutputIndex,
-				"arguments": tc.Arguments,
-			}),
-			sseEvent("response.output_item.done", map[string]any{
-				"output_index": *tc.OutputIndex,
-				"item":         renderStreamToolCallItem(tc.spec, tc.ItemID, tc.ID, tc.Arguments, "completed"),
-			}),
-		)
+		events = append(events, item.doneEvents...)
 	}
 	return events
 }
@@ -2209,24 +2136,82 @@ func (c *StreamingConverter) finishResponse(status string) []string {
 }
 
 func (c *StreamingConverter) buildOutput() []any {
-	var output []any
+	items := c.orderedFinalOutputItems()
+	output := make([]any, 0, len(items))
+	for _, item := range items {
+		output = append(output, item.output)
+	}
+	return output
+}
+
+func (c *StreamingConverter) orderedFinalOutputItems() []finalStreamingOutputItem {
+	items := make([]finalStreamingOutputItem, 0, 1+len(c.toolCalls))
+
 	if c.reasoningText != "" {
-		output = append(output, map[string]any{
-			"type": "reasoning", "id": c.reasoningItemID(), "status": "completed",
-			"summary": []any{
-				map[string]any{"type": "summary_text", "text": c.reasoningText},
+		outputIndex := c.reasoningOutputIndexValue()
+		items = append(items, finalStreamingOutputItem{
+			outputIndex: outputIndex,
+			output: map[string]any{
+				"type": "reasoning", "id": c.reasoningItemID(), "status": "completed",
+				"summary": []any{
+					map[string]any{"type": "summary_text", "text": c.reasoningText},
+				},
+			},
+			doneEvents: []string{
+				sseEvent("response.reasoning_text.done", map[string]any{
+					"item_id": c.reasoningItemID(), "output_index": outputIndex, "content_index": 0,
+					"text": c.reasoningText,
+				}),
+				sseEvent("response.output_item.done", map[string]any{
+					"output_index": outputIndex,
+					"item": map[string]any{
+						"type": "reasoning", "id": c.reasoningItemID(), "status": "completed",
+						"summary": []any{
+							map[string]any{"type": "summary_text", "text": c.reasoningText},
+						},
+					},
+				}),
 			},
 		})
 	}
+
 	if c.contentPartAdded {
-		output = append(output, map[string]any{
-			"type": "message", "id": c.messageID, "status": "completed",
-			"role":    c.messageRole,
-			"content": []any{map[string]any{"type": "output_text", "text": c.fullText, "annotations": []any{}}},
+		outputIndex := c.messageOutputIndexValue()
+		items = append(items, finalStreamingOutputItem{
+			outputIndex: outputIndex,
+			output: map[string]any{
+				"type": "message", "id": c.messageID, "status": "completed",
+				"role":    c.messageRole,
+				"content": []any{map[string]any{"type": "output_text", "text": c.fullText, "annotations": []any{}}},
+			},
+			doneEvents: []string{
+				sseEvent("response.output_text.done", map[string]any{
+					"item_id": c.messageID, "output_index": outputIndex,
+					"content_index": 0, "text": c.fullText,
+				}),
+				sseEvent("response.content_part.done", map[string]any{
+					"item_id": c.messageID, "output_index": outputIndex,
+					"content_index": 0,
+					"part": map[string]any{
+						"type": "output_text", "text": c.fullText, "annotations": []any{},
+					},
+				}),
+				sseEvent("response.output_item.done", map[string]any{
+					"output_index": outputIndex,
+					"item": map[string]any{
+						"type": "message", "id": c.messageID, "status": "completed",
+						"role": c.messageRole, "content": []any{map[string]any{"type": "output_text", "text": c.fullText, "annotations": []any{}}},
+					},
+				}),
+			},
 		})
 	}
+
 	for _, index := range sortedToolIndexes(c.toolCalls) {
 		tc := c.toolCalls[index]
+		if tc.OutputIndex == nil {
+			continue
+		}
 		tc.spec = normalizeStreamToolCall(tc.Name, tc.Arguments)
 		if tc.spec.kind == streamToolCallKindUnknown {
 			tc.spec = streamToolCallSpecFromArguments(tc.Name, tc.Arguments)
@@ -2234,9 +2219,37 @@ func (c *StreamingConverter) buildOutput() []any {
 		if tc.ItemID == "" {
 			tc.ItemID = c.toolItemIDForSpec(tc.spec, tc.ID, index)
 		}
-		output = append(output, renderStreamToolCallItem(tc.spec, tc.ItemID, tc.ID, tc.Arguments, "completed"))
+		outputIndex := *tc.OutputIndex
+		item := renderStreamToolCallItem(tc.spec, tc.ItemID, tc.ID, tc.Arguments, "completed")
+		addedEvent := ""
+		if !tc.Added {
+			tc.Added = true
+			addedEvent = sseEvent("response.output_item.added", map[string]any{
+				"output_index": outputIndex,
+				"item":         renderStreamToolCallItem(tc.spec, tc.ItemID, tc.ID, tc.Arguments, "in_progress"),
+			})
+		}
+		items = append(items, finalStreamingOutputItem{
+			outputIndex: outputIndex,
+			addedEvent:  addedEvent,
+			output:      item,
+			doneEvents: []string{
+				sseEvent("response.function_call_arguments.done", map[string]any{
+					"item_id": tc.ItemID, "output_index": outputIndex,
+					"arguments": tc.Arguments,
+				}),
+				sseEvent("response.output_item.done", map[string]any{
+					"output_index": outputIndex,
+					"item":         item,
+				}),
+			},
+		})
 	}
-	return output
+
+	sort.SliceStable(items, func(i, j int) bool {
+		return items[i].outputIndex < items[j].outputIndex
+	})
+	return items
 }
 
 func (c *StreamingConverter) buildUsage() map[string]any {
