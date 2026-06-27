@@ -473,6 +473,55 @@ func TestConvertResponseReasoningContentPartDoesNotPolluteVisibleMessage(t *test
 	}
 }
 
+func TestConvertResponseThinkOnlyContentStaysInvisible(t *testing.T) {
+	stringCase := ConvertResponse(map[string]any{
+		"id":      "chatcmpl-abc",
+		"created": 123,
+		"model":   "test-model",
+		"choices": []any{
+			map[string]any{
+				"finish_reason": "stop",
+				"message":       map[string]any{"role": "assistant", "content": "<think>Hidden only.</think>"},
+			},
+		},
+	}, map[string]any{"model": "test-model", "input": "Hello"})
+
+	output := stringCase["output"].([]any)
+	if len(output) != 2 {
+		t.Fatalf("unexpected string-case output length: %#v", output)
+	}
+	msg := output[1].(map[string]any)
+	if content := msg["content"].([]any); len(content) != 0 {
+		t.Fatalf("think-only string should not leak visible content: %#v", content)
+	}
+
+	arrayCase := ConvertResponse(map[string]any{
+		"id":      "chatcmpl-def",
+		"created": 123,
+		"model":   "test-model",
+		"choices": []any{
+			map[string]any{
+				"finish_reason": "stop",
+				"message": map[string]any{
+					"role": "assistant",
+					"content": []any{
+						map[string]any{"type": "text", "text": "<thinking>Hidden block.</thinking>"},
+					},
+				},
+			},
+		},
+	}, map[string]any{"model": "test-model", "input": "Hello"})
+
+	output = arrayCase["output"].([]any)
+	if len(output) != 2 {
+		t.Fatalf("unexpected array-case output length: %#v", output)
+	}
+	msg = output[1].(map[string]any)
+	if content := msg["content"].([]any); len(content) != 0 {
+		t.Fatalf("think-only content part should not emit empty output_text: %#v", content)
+	}
+}
+
 func TestStreamingConverterHandlesReasoningObjectDeltas(t *testing.T) {
 	converter := NewStreamingConverter()
 	chunk := "data: " + mustJSON(map[string]any{
@@ -532,6 +581,61 @@ func TestStreamingConverterHandlesReasoningObjectDeltas(t *testing.T) {
 	content := message["content"].([]any)
 	if content[0].(map[string]any)["text"] != "Visible answer." {
 		t.Fatalf("unexpected visible text: %#v", content)
+	}
+}
+
+func TestStreamingConverterReasoningUsesResponseSuffixAndOutputIndex(t *testing.T) {
+	converter := NewStreamingConverter()
+	chunk := "data: " + mustJSON(map[string]any{
+		"id":      "chatcmpl-abc",
+		"created": 123,
+		"model":   "test-model",
+		"choices": []any{
+			map[string]any{
+				"delta":         map[string]any{"role": "assistant", "content": "Visible answer."},
+				"finish_reason": nil,
+			},
+		},
+	}) + "\n\n" + "data: " + mustJSON(map[string]any{
+		"id":      "chatcmpl-abc",
+		"created": 123,
+		"model":   "test-model",
+		"choices": []any{
+			map[string]any{
+				"delta":         map[string]any{"content": "<think>Hidden thought.</think>"},
+				"finish_reason": nil,
+			},
+		},
+	}) + "\n\n" + "data: " + mustJSON(map[string]any{
+		"id":      "chatcmpl-abc",
+		"created": 123,
+		"model":   "test-model",
+		"choices": []any{
+			map[string]any{"delta": map[string]any{}, "finish_reason": "stop"},
+		},
+	}) + "\n\n"
+
+	payloads := ssePayloads(converter.Feed([]byte(chunk)))
+	var reasoningDelta map[string]any
+	for _, payload := range payloads {
+		if payload["type"] == "response.reasoning_text.delta" {
+			reasoningDelta = payload
+			break
+		}
+	}
+	if reasoningDelta == nil {
+		t.Fatalf("missing reasoning delta payloads=%#v", payloads)
+	}
+	if reasoningDelta["item_id"] != "rs_abc" {
+		t.Fatalf("expected reasoning item_id rs_abc, got %#v", reasoningDelta["item_id"])
+	}
+	if reasoningDelta["output_index"] != float64(1) {
+		t.Fatalf("expected reasoning output_index 1, got %#v", reasoningDelta["output_index"])
+	}
+	for _, payload := range payloads {
+		if payload["type"] == "response.output_text.delta" && payload["delta"] == "" {
+			t.Fatalf("unexpected empty visible delta: %#v", payload)
+		}
 	}
 }
 

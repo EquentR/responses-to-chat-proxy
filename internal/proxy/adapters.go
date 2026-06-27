@@ -1090,9 +1090,7 @@ func buildOutputItem(message map[string]any, responseID, finishReason string, tc
 	if role == "" {
 		role = "assistant"
 	}
-	suffix := strings.TrimPrefix(responseID, "resp-")
-	suffix = strings.TrimPrefix(suffix, "resp_")
-	itemID := "msg_" + suffix
+	itemID := "msg_" + responseSuffix(responseID)
 
 	outputItem := map[string]any{
 		"type":    "message",
@@ -1104,13 +1102,9 @@ func buildOutputItem(message map[string]any, responseID, finishReason string, tc
 
 	switch content := message["content"].(type) {
 	case string:
-		visible := content
 		if messageText != "" {
-			visible = messageText
-		}
-		if visible != "" {
 			outputItem["content"] = []any{map[string]any{
-				"type": "output_text", "text": visible, "annotations": []any{},
+				"type": "output_text", "text": messageText, "annotations": []any{},
 			}}
 		}
 	case nil:
@@ -1144,7 +1138,7 @@ func buildOutputItem(message map[string]any, responseID, finishReason string, tc
 func convertOutputPartWithoutThinking(part map[string]any, messageText string) map[string]any {
 	if stringValue(part["type"]) == "text" {
 		_, visible := splitThinkTag(stringValue(part["text"]))
-		if messageText != "" && visible == "" {
+		if visible == "" {
 			return nil
 		}
 		return map[string]any{
@@ -1576,6 +1570,7 @@ type StreamingConverter struct {
 	sawSubstantiveOutput bool
 	nextOutputIndex      int
 	messageOutputIndex   *int
+	reasoningOutputIndex *int
 	responseID           string
 	messageID            string
 	model                string
@@ -1719,19 +1714,20 @@ func (c *StreamingConverter) processChunk(data map[string]any) []string {
 
 	// visible content delta
 	if content := stringValue(delta["content"]); content != "" {
-		if thinkR, visible := splitThinkTag(content); thinkR != "" {
-			content = visible
+		visible := content
+		if thinkR, visibleText := splitThinkTag(content); thinkR != "" {
+			visible = visibleText
 			events = append(events, c.appendReasoningDelta(thinkR)...)
 		}
-		events = append(events, c.ensureContentPart()...)
-		c.fullText += content
-		if content != "" {
+		if visible != "" {
+			events = append(events, c.ensureContentPart()...)
+			c.fullText += visible
 			c.sawSubstantiveOutput = true
+			events = append(events, sseEvent("response.output_text.delta", map[string]any{
+				"item_id": c.messageID, "output_index": c.messageOutputIndexValue(),
+				"content_index": 0, "delta": visible,
+			}))
 		}
-		events = append(events, sseEvent("response.output_text.delta", map[string]any{
-			"item_id": c.messageID, "output_index": c.messageOutputIndexValue(),
-			"content_index": 0, "delta": content,
-		}))
 	}
 
 	// reasoning_details delta (MiniMax)
@@ -1782,12 +1778,8 @@ func (c *StreamingConverter) appendReasoningDelta(delta string) []string {
 	c.reasoningText += delta
 	c.sawSubstantiveOutput = true
 	events := c.ensureReasoningItem()
-	itemID := "rs_" + strings.TrimPrefix(c.responseID, "resp_")
-	if itemID == "rs_" {
-		itemID = "rs_unknown"
-	}
 	events = append(events, sseEvent("response.reasoning_text.delta", map[string]any{
-		"item_id": itemID, "output_index": 0,
+		"item_id": c.reasoningItemID(), "output_index": c.reasoningOutputIndexValue(),
 		"content_index": 0, "delta": delta,
 	}))
 	return events
@@ -1798,16 +1790,12 @@ func (c *StreamingConverter) ensureReasoningItem() []string {
 		return nil
 	}
 	c.reasoningDone = true
-	outputIndex := c.allocateOutputIndex()
-	itemID := "rs_" + strings.TrimPrefix(c.responseID, "resp_")
-	if itemID == "rs_" {
-		itemID = "rs_unknown"
-	}
+	outputIndex := c.reasoningOutputIndexValue()
 	return []string{sseEvent("response.output_item.added", map[string]any{
 		"output_index": outputIndex,
 		"item": map[string]any{
 			"type":    "reasoning",
-			"id":      itemID,
+			"id":      c.reasoningItemID(),
 			"status":  "in_progress",
 			"summary": []any{},
 		},
@@ -1819,12 +1807,8 @@ func (c *StreamingConverter) ensureReasoningDelta() []string {
 		return nil
 	}
 	events := c.ensureReasoningItem()
-	itemID := "rs_" + strings.TrimPrefix(c.responseID, "resp_")
-	if itemID == "rs_" {
-		itemID = "rs_unknown"
-	}
 	events = append(events, sseEvent("response.reasoning_text.delta", map[string]any{
-		"item_id": itemID, "output_index": 0,
+		"item_id": c.reasoningItemID(), "output_index": c.reasoningOutputIndexValue(),
 		"content_index": 0, "delta": c.reasoningText,
 	}))
 	return events
@@ -1976,16 +1960,15 @@ func (c *StreamingConverter) finishReasoningEvents() []string {
 	if !c.reasoningDone || c.reasoningText == "" {
 		return nil
 	}
-	itemID := "rs_" + strings.TrimPrefix(c.responseID, "resp_")
 	return []string{
 		sseEvent("response.reasoning_text.done", map[string]any{
-			"item_id": itemID, "output_index": 0, "content_index": 0,
+			"item_id": c.reasoningItemID(), "output_index": c.reasoningOutputIndexValue(), "content_index": 0,
 			"text": c.reasoningText,
 		}),
 		sseEvent("response.output_item.done", map[string]any{
-			"output_index": 0,
+			"output_index": c.reasoningOutputIndexValue(),
 			"item": map[string]any{
-				"type": "reasoning", "id": itemID, "status": "completed",
+				"type": "reasoning", "id": c.reasoningItemID(), "status": "completed",
 				"summary": []any{
 					map[string]any{"type": "summary_text", "text": c.reasoningText},
 				},
@@ -2067,9 +2050,8 @@ func (c *StreamingConverter) finishResponse(status string) []string {
 func (c *StreamingConverter) buildOutput() []any {
 	var output []any
 	if c.reasoningText != "" {
-		itemID := "rs_" + strings.TrimPrefix(c.responseID, "resp_")
 		output = append(output, map[string]any{
-			"type": "reasoning", "id": itemID, "status": "completed",
+			"type": "reasoning", "id": c.reasoningItemID(), "status": "completed",
 			"summary": []any{
 				map[string]any{"type": "summary_text", "text": c.reasoningText},
 			},
@@ -2116,6 +2098,28 @@ func (c *StreamingConverter) messageOutputIndexValue() int {
 		c.messageOutputIndex = &idx
 	}
 	return *c.messageOutputIndex
+}
+
+func (c *StreamingConverter) reasoningOutputIndexValue() int {
+	if c.reasoningOutputIndex == nil {
+		idx := c.allocateOutputIndex()
+		c.reasoningOutputIndex = &idx
+	}
+	return *c.reasoningOutputIndex
+}
+
+func (c *StreamingConverter) reasoningItemID() string {
+	suffix := responseSuffix(c.responseID)
+	return "rs_" + suffix
+}
+
+func responseSuffix(responseID string) string {
+	suffix := strings.TrimPrefix(responseID, "resp-")
+	suffix = strings.TrimPrefix(suffix, "resp_")
+	if suffix == "" {
+		return "unknown"
+	}
+	return suffix
 }
 
 func (c *StreamingConverter) toolItemIDForSpec(spec normalizedStreamToolCall, callID string, index int) string {
