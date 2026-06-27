@@ -257,6 +257,9 @@ func extractModelItems(payload any) ([]map[string]any, bool) {
 	case []any:
 		return extractModelItemsFromSlice(typed)
 	case map[string]any:
+		if looksLikeErrorPayload(typed) {
+			return nil, false
+		}
 		for _, key := range []string{"data", "models", "items", "results", "result"} {
 			switch values := typed[key].(type) {
 			case []any:
@@ -272,6 +275,15 @@ func extractModelItems(payload any) ([]map[string]any, bool) {
 		}
 	}
 	return nil, false
+}
+
+func looksLikeErrorPayload(payload map[string]any) bool {
+	for _, key := range []string{"error", "errors"} {
+		if _, ok := payload[key]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func extractModelItemsFromSlice(values []any) ([]map[string]any, bool) {
