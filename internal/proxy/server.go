@@ -64,6 +64,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleResponses(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions":
 		s.handleChatCompletions(w, r)
+	case r.Method == http.MethodPost && r.URL.Path == "/v1/messages":
+		s.handleMessages(w, r)
 	case strings.HasPrefix(r.URL.Path, "/v1/"):
 		s.forwardUnknownV1(w, r)
 	default:
@@ -81,16 +83,40 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, errorPayload(err.Error(), "invalid_request_error", "invalid_json"))
 		return
 	}
-	if _, ok := body["model"]; !ok {
-		writeJSON(w, http.StatusBadRequest, errorPayload(
-			"Missing required parameter: model",
-			"invalid_request_error",
-			"missing_required_parameter",
-			"model",
-		))
+	model := s.requestModel(body)
+	if model == "" {
+		writeMissingModel(w)
 		return
 	}
 
+	if route, ok := s.resolveRoute(model); ok {
+		switch route.Protocol {
+		case RouteProtocolResponses:
+			endpointURL := s.routeEndpointURL(route, RouteProtocolResponses)
+			if boolValue(body["stream"]) {
+				s.passthroughStream(w, r, body, endpointURL, RouteProtocolResponses)
+				return
+			}
+			s.passthroughNormal(w, r, body, endpointURL)
+			return
+		case RouteProtocolChat:
+			s.forwardResponsesAsChat(w, r, body, route)
+			return
+		case RouteProtocolMessages:
+			s.writeUnsupportedProtocol(w, fmt.Sprintf("Responses to messages conversion is not supported for model %q.", model))
+			return
+		default:
+			s.writeUnsupportedProtocol(w, fmt.Sprintf("Model %q resolved to unsupported protocol %q.", model, route.Protocol))
+			return
+		}
+	}
+
+	// Backward-compatible fallback: Responses requests without a route keep the
+	// historical Responses->Chat conversion path.
+	s.forwardResponsesAsChat(w, r, body, RouteEntry{Protocol: RouteProtocolChat})
+}
+
+func (s *Server) forwardResponsesAsChat(w http.ResponseWriter, r *http.Request, body map[string]any, route RouteEntry) {
 	chatRequest := ConvertRequest(body, s.config)
 
 	// Apply cache-optimizer: inject cache_control breakpoints for prompt caching.
@@ -99,11 +125,11 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if boolValue(chatRequest["stream"]) {
-		s.streamResponses(w, r, body, chatRequest)
+		s.streamResponses(w, r, body, chatRequest, s.routeEndpointURL(route, RouteProtocolChat))
 		return
 	}
 
-	s.forwardConvertedResponse(w, r, body, chatRequest)
+	s.forwardConvertedResponse(w, r, body, chatRequest, s.routeEndpointURL(route, RouteProtocolChat))
 }
 
 func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -111,18 +137,61 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := readAnyJSON(r.Body)
+	body, err := readJSONObject(r.Body)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, errorPayload("Request body must be valid JSON.", "invalid_request_error", "invalid_json"))
+		writeJSON(w, http.StatusBadRequest, errorPayload(err.Error(), "invalid_request_error", "invalid_json"))
+		return
+	}
+	model := s.requestModel(body)
+	if model == "" {
+		writeMissingModel(w)
 		return
 	}
 
-	if dict, ok := body.(map[string]any); ok && boolValue(dict["stream"]) {
-		s.passthroughStream(w, r, dict)
+	route, ok := s.resolveRoute(model)
+	if !ok || route.Protocol != RouteProtocolChat {
+		s.writeUnsupportedProtocol(w, fmt.Sprintf("Model %q does not support chat completions on this route.", model))
 		return
 	}
 
-	s.passthroughNormal(w, r, body)
+	endpointURL := s.routeEndpointURL(route, RouteProtocolChat)
+	if boolValue(body["stream"]) {
+		s.passthroughStream(w, r, body, endpointURL, RouteProtocolChat)
+		return
+	}
+
+	s.passthroughNormal(w, r, body, endpointURL)
+}
+
+func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
+	if !s.authorize(w, r) {
+		return
+	}
+
+	body, err := readJSONObject(r.Body)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errorPayload(err.Error(), "invalid_request_error", "invalid_json"))
+		return
+	}
+	model := s.requestModel(body)
+	if model == "" {
+		writeMissingModel(w)
+		return
+	}
+
+	route, ok := s.resolveRoute(model)
+	if !ok || route.Protocol != RouteProtocolMessages {
+		s.writeUnsupportedProtocol(w, fmt.Sprintf("Model %q does not support messages on this route.", model))
+		return
+	}
+
+	endpointURL := s.routeEndpointURL(route, RouteProtocolMessages)
+	if _, hasStream := body["stream"]; hasStream {
+		s.passthroughStream(w, r, body, endpointURL, RouteProtocolMessages)
+		return
+	}
+
+	s.passthroughNormal(w, r, body, endpointURL)
 }
 
 // forwardConvertedWithRectifier forwards a converted request, retrying once if
@@ -216,7 +285,7 @@ func (s *Server) forwardUnknownV1(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, response.StatusCode, data)
 }
 
-func (s *Server) forwardConvertedResponse(w http.ResponseWriter, r *http.Request, originalRequest, chatRequest map[string]any) {
+func (s *Server) forwardConvertedResponse(w http.ResponseWriter, r *http.Request, originalRequest, chatRequest map[string]any, endpointURL string) {
 	body, err := json.Marshal(chatRequest)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, errorPayload("Request conversion error.", "invalid_request_error", "conversion_error"))
@@ -227,7 +296,7 @@ func (s *Server) forwardConvertedResponse(w http.ResponseWriter, r *http.Request
 		r.Context(),
 		s.normalClient,
 		http.MethodPost,
-		s.config.UpstreamBaseURL+"/chat/completions",
+		endpointURL,
 		copyHeaders(r.Header, s.config.UpstreamAPIKey),
 		bytes.NewReader(body),
 	)
@@ -246,7 +315,7 @@ func (s *Server) forwardConvertedResponse(w http.ResponseWriter, r *http.Request
 	writeJSON(w, response.StatusCode, ConvertResponse(responseData, originalRequest))
 }
 
-func (s *Server) streamResponses(w http.ResponseWriter, r *http.Request, _ map[string]any, chatRequest map[string]any) {
+func (s *Server) streamResponses(w http.ResponseWriter, r *http.Request, _ map[string]any, chatRequest map[string]any, endpointURL string) {
 	streamBody := cloneMap(chatRequest)
 	streamBody["stream"] = true
 	body, err := json.Marshal(streamBody)
@@ -261,7 +330,7 @@ func (s *Server) streamResponses(w http.ResponseWriter, r *http.Request, _ map[s
 	ctx, cancel := context.WithTimeout(r.Context(), s.config.StreamTimeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.config.UpstreamBaseURL+"/chat/completions", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpointURL, bytes.NewReader(body))
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, errorPayload("Failed to build upstream request.", "server_error", "request_build_failed"))
 		return
@@ -319,7 +388,7 @@ func (s *Server) streamResponses(w http.ResponseWriter, r *http.Request, _ map[s
 	}
 }
 
-func (s *Server) passthroughNormal(w http.ResponseWriter, r *http.Request, body any) {
+func (s *Server) passthroughNormal(w http.ResponseWriter, r *http.Request, body any, endpointURL string) {
 	payload, err := json.Marshal(body)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, errorPayload("Request body must be valid JSON.", "invalid_request_error", "invalid_json"))
@@ -330,7 +399,7 @@ func (s *Server) passthroughNormal(w http.ResponseWriter, r *http.Request, body 
 		r.Context(),
 		s.normalClient,
 		http.MethodPost,
-		s.config.UpstreamBaseURL+"/chat/completions",
+		endpointURL,
 		copyHeaders(r.Header, s.config.UpstreamAPIKey),
 		bytes.NewReader(payload),
 	)
@@ -343,7 +412,7 @@ func (s *Server) passthroughNormal(w http.ResponseWriter, r *http.Request, body 
 	writeJSON(w, response.StatusCode, parseResponseJSON(response))
 }
 
-func (s *Server) passthroughStream(w http.ResponseWriter, r *http.Request, body map[string]any) {
+func (s *Server) passthroughStream(w http.ResponseWriter, r *http.Request, body map[string]any, endpointURL string, protocol RouteProtocol) {
 	payload, err := json.Marshal(body)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, errorPayload("Request body must be valid JSON.", "invalid_request_error", "invalid_json"))
@@ -353,7 +422,7 @@ func (s *Server) passthroughStream(w http.ResponseWriter, r *http.Request, body 
 	ctx, cancel := context.WithTimeout(r.Context(), s.config.StreamTimeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.config.UpstreamBaseURL+"/chat/completions", bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpointURL, bytes.NewReader(payload))
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, errorPayload("Failed to build upstream request.", "server_error", "request_build_failed"))
 		return
@@ -375,6 +444,14 @@ func (s *Server) passthroughStream(w http.ResponseWriter, r *http.Request, body 
 	w.WriteHeader(http.StatusOK)
 
 	flusher, _ := w.(http.Flusher)
+	if protocol != RouteProtocolChat {
+		_, _ = io.Copy(w, resp.Body)
+		if flusher != nil {
+			flusher.Flush()
+		}
+		return
+	}
+
 	normalizer := newChatCompletionStreamNormalizer()
 	buffer := make([]byte, 4096)
 	for {
@@ -396,6 +473,60 @@ func (s *Server) passthroughStream(w http.ResponseWriter, r *http.Request, body 
 		writeSSEChunks(w, flusher, sseError(fmt.Sprintf("Upstream request failed: %v", readErr), "upstream_request_failed"))
 		return
 	}
+}
+
+func (s *Server) requestModel(body map[string]any) string {
+	if s.config.ModelOverride != "" {
+		return s.config.ModelOverride
+	}
+	return stringValue(body["model"])
+}
+
+func (s *Server) resolveRoute(model string) (RouteEntry, bool) {
+	identity := RouteIdentityKey(s.config.UpstreamBaseURL, s.config.UpstreamAPIKey)
+	return s.routeTable.Resolve(identity, model)
+}
+
+func (s *Server) routeEndpointURL(route RouteEntry, fallbackProtocol RouteProtocol) string {
+	endpoint := strings.TrimSpace(route.Endpoint)
+	if endpoint == "" {
+		endpoint = defaultEndpointForProtocol(fallbackProtocol)
+	}
+	return joinUpstreamEndpoint(s.config.UpstreamBaseURL, endpoint)
+}
+
+func joinUpstreamEndpoint(baseURL, endpoint string) string {
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	endpoint = strings.TrimSpace(endpoint)
+	if endpoint == "" {
+		return baseURL
+	}
+	if strings.HasPrefix(endpoint, "http://") || strings.HasPrefix(endpoint, "https://") {
+		return endpoint
+	}
+	if !strings.HasPrefix(endpoint, "/") {
+		endpoint = "/" + endpoint
+	}
+	if hasVersionPathSuffix(baseURL) && (endpoint == "/v1" || strings.HasPrefix(endpoint, "/v1/")) {
+		endpoint = strings.TrimPrefix(endpoint, "/v1")
+		if endpoint == "" {
+			return baseURL
+		}
+	}
+	return baseURL + endpoint
+}
+
+func (s *Server) writeUnsupportedProtocol(w http.ResponseWriter, message string) {
+	writeJSON(w, http.StatusBadRequest, errorPayload(message, "invalid_request_error", "unsupported_protocol"))
+}
+
+func writeMissingModel(w http.ResponseWriter) {
+	writeJSON(w, http.StatusBadRequest, errorPayload(
+		"Missing required parameter: model",
+		"invalid_request_error",
+		"missing_required_parameter",
+		"model",
+	))
 }
 
 func (s *Server) authorize(w http.ResponseWriter, r *http.Request) bool {
