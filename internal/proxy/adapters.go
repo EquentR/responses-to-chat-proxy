@@ -41,8 +41,7 @@ type messageTextParts struct {
 }
 
 func (p *messageTextParts) addReasoning(text string) {
-	text = strings.TrimSpace(text)
-	if text != "" {
+	if strings.TrimSpace(text) != "" {
 		p.reasoningParts = append(p.reasoningParts, text)
 	}
 }
@@ -155,17 +154,17 @@ func (p *messageTextParts) collectVisible(value any) {
 			return
 		case "text", "output_text", "input_text":
 			if text := stringValue(typed["text"]); text != "" {
-				p.addVisible(text)
+				p.collectVisible(text)
 				return
 			}
 			if text := stringValue(typed["content"]); text != "" {
-				p.addVisible(text)
+				p.collectVisible(text)
 				return
 			}
 		}
 
 		if text := stringValue(typed["text"]); text != "" {
-			p.addVisible(text)
+			p.collectVisible(text)
 		}
 		if content, ok := typed["content"]; ok {
 			p.collectVisible(content)
@@ -467,6 +466,7 @@ func ConvertResponse(chatResp, originalReq map[string]any) map[string]any {
 
 	var output []any
 	reasoningText, messageText := extractReasoningAndMessage(message)
+	status, incompleteDetails := mapFinishReasonForOutput(finishReason, nil)
 
 	if reasoningText != "" {
 		suffix := strings.TrimPrefix(responseID, "resp-")
@@ -490,7 +490,8 @@ func ConvertResponse(chatResp, originalReq map[string]any) map[string]any {
 
 	output = append(output, buildToolOutputItems(message, responseID, tc)...)
 
-	status, incompleteDetails := mapFinishReason(finishReason)
+	status, incompleteDetails = mapFinishReasonForOutput(finishReason, output)
+	output = finalizeOutputItems(output, status)
 
 	usage := convertUsage(chatResp["usage"])
 	if reasoningText != "" {
@@ -532,6 +533,29 @@ func extractReasoningAndMessage(message map[string]any) (reasoning, visible stri
 	parts.collectVisible(message["content"])
 
 	return strings.Join(parts.reasoningParts, "\n"), strings.Join(parts.visibleParts, "")
+}
+
+func finalizeOutputItems(output []any, responseStatus string) []any {
+	if responseStatus == "failed" {
+		var kept []any
+		for _, raw := range output {
+			item, ok := raw.(map[string]any)
+			if !ok || hasSubstantiveResponseOutput([]any{item}) {
+				kept = append(kept, raw)
+			}
+		}
+		return kept
+	}
+	for _, raw := range output {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if stringValue(item["status"]) == "in_progress" {
+			item["status"] = "completed"
+		}
+	}
+	return output
 }
 
 func splitThinkTag(content string) (reasoning, visible string) {
@@ -889,6 +913,10 @@ func (tc *toolContext) addCustomTool(name, desc string) {
 	if desc == "" {
 		desc = customToolInputDesc
 	}
+	inputDesc := customToolInputDesc
+	if desc != customToolInputDesc {
+		inputDesc += "\n\n" + desc
+	}
 	chatTool := map[string]any{
 		"type": "function",
 		"function": map[string]any{
@@ -899,7 +927,7 @@ func (tc *toolContext) addCustomTool(name, desc string) {
 				"properties": map[string]any{
 					customToolInputField: map[string]any{
 						"type":        "string",
-						"description": customToolInputDesc,
+						"description": inputDesc,
 					},
 				},
 				"required": []any{customToolInputField},
@@ -986,6 +1014,10 @@ func responsesToChatFunctionTool(tool map[string]any, chatName string) map[strin
 }
 
 func buildCustomToolDesc(tool map[string]any) string {
+	definition, err := json.MarshalIndent(tool, "", "  ")
+	if err == nil && len(definition) > 0 {
+		return customToolPreservedHeader + "\n" + string(definition)
+	}
 	desc := stringValue(tool["description"])
 	if desc == "" {
 		desc = stringValue(tool["name"])
@@ -1095,10 +1127,10 @@ func buildOutputItem(message map[string]any, responseID, finishReason string, tc
 				continue
 			}
 			pt := stringValue(part["type"])
-			if pt == "thinking" || pt == "redacted_thinking" || pt == "summary_text" || pt == "reasoning_text" {
+			if isReasoningContentPartType(pt) {
 				continue
 			}
-			converted := convertOutputPartWithoutThinking(part)
+			converted := convertOutputPartWithoutThinking(part, messageText)
 			if converted != nil {
 				textContent = append(textContent, converted)
 			}
@@ -1109,13 +1141,26 @@ func buildOutputItem(message map[string]any, responseID, finishReason string, tc
 	return outputItem
 }
 
-func convertOutputPartWithoutThinking(part map[string]any) map[string]any {
+func convertOutputPartWithoutThinking(part map[string]any, messageText string) map[string]any {
 	if stringValue(part["type"]) == "text" {
+		_, visible := splitThinkTag(stringValue(part["text"]))
+		if messageText != "" && visible == "" {
+			return nil
+		}
 		return map[string]any{
-			"type": "output_text", "text": stringValue(part["text"]), "annotations": []any{},
+			"type": "output_text", "text": visible, "annotations": []any{},
 		}
 	}
 	return part
+}
+
+func isReasoningContentPartType(partType string) bool {
+	switch partType {
+	case "thinking", "redacted_thinking", "summary_text", "reasoning_text", "reasoning":
+		return true
+	default:
+		return false
+	}
 }
 
 func buildToolOutputItems(message map[string]any, responseID string, tc *toolContext) []any {
@@ -1290,6 +1335,48 @@ func mapFinishReason(finishReason string) (string, map[string]any) {
 	default:
 		return "completed", nil
 	}
+}
+
+func mapFinishReasonForOutput(finishReason string, output []any) (string, map[string]any) {
+	if finishReason != "" {
+		return mapFinishReason(finishReason)
+	}
+	if hasSubstantiveResponseOutput(output) {
+		return "incomplete", nil
+	}
+	return "failed", nil
+}
+
+func hasSubstantiveResponseOutput(output []any) bool {
+	for _, raw := range output {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch stringValue(item["type"]) {
+		case "message":
+			if content, ok := item["content"].([]any); ok {
+				for _, rawPart := range content {
+					part, _ := rawPart.(map[string]any)
+					if strings.TrimSpace(stringValue(part["text"])) != "" {
+						return true
+					}
+				}
+			}
+		case "reasoning":
+			if summary, ok := item["summary"].([]any); ok {
+				for _, rawPart := range summary {
+					part, _ := rawPart.(map[string]any)
+					if strings.TrimSpace(stringValue(part["text"])) != "" {
+						return true
+					}
+				}
+			}
+		case "function_call", "custom_tool_call", "tool_search_call":
+			return true
+		}
+	}
+	return false
 }
 
 func convertUsage(rawUsage any) map[string]any {
@@ -1623,18 +1710,18 @@ func (c *StreamingConverter) processChunk(data map[string]any) []string {
 
 	// reasoning_content (DeepSeek, Kimi, GLM)
 	if rc := stringValue(delta["reasoning_content"]); rc != "" {
-		c.reasoningText += rc
-		c.sawSubstantiveOutput = true
-		events = append(events, c.ensureReasoningDelta()...)
+		events = append(events, c.appendReasoningDelta(rc)...)
+	}
+
+	if reasoningDelta := extractReasoningDelta(delta["reasoning"]); reasoningDelta != "" {
+		events = append(events, c.appendReasoningDelta(reasoningDelta)...)
 	}
 
 	// visible content delta
 	if content := stringValue(delta["content"]); content != "" {
 		if thinkR, visible := splitThinkTag(content); thinkR != "" {
-			c.reasoningText += thinkR
-			c.sawSubstantiveOutput = true
 			content = visible
-			events = append(events, c.ensureReasoningDelta()...)
+			events = append(events, c.appendReasoningDelta(thinkR)...)
 		}
 		events = append(events, c.ensureContentPart()...)
 		c.fullText += content
@@ -1652,9 +1739,7 @@ func (c *StreamingConverter) processChunk(data map[string]any) []string {
 		for _, d := range details {
 			if dm, ok := d.(map[string]any); ok {
 				if text := stringValue(dm["text"]); text != "" {
-					c.reasoningText += text
-					c.sawSubstantiveOutput = true
-					events = append(events, c.ensureReasoningDelta()...)
+					events = append(events, c.appendReasoningDelta(text)...)
 				}
 			}
 		}
@@ -1684,8 +1769,32 @@ func (c *StreamingConverter) processChunk(data map[string]any) []string {
 	return events
 }
 
-func (c *StreamingConverter) ensureReasoningDelta() []string {
-	if c.reasoningDone || c.reasoningText == "" {
+func extractReasoningDelta(value any) string {
+	parts := messageTextParts{}
+	parts.collectReasoning(value)
+	return strings.Join(parts.reasoningParts, "")
+}
+
+func (c *StreamingConverter) appendReasoningDelta(delta string) []string {
+	if delta == "" {
+		return nil
+	}
+	c.reasoningText += delta
+	c.sawSubstantiveOutput = true
+	events := c.ensureReasoningItem()
+	itemID := "rs_" + strings.TrimPrefix(c.responseID, "resp_")
+	if itemID == "rs_" {
+		itemID = "rs_unknown"
+	}
+	events = append(events, sseEvent("response.reasoning_text.delta", map[string]any{
+		"item_id": itemID, "output_index": 0,
+		"content_index": 0, "delta": delta,
+	}))
+	return events
+}
+
+func (c *StreamingConverter) ensureReasoningItem() []string {
+	if c.reasoningDone {
 		return nil
 	}
 	c.reasoningDone = true
@@ -1694,21 +1803,31 @@ func (c *StreamingConverter) ensureReasoningDelta() []string {
 	if itemID == "rs_" {
 		itemID = "rs_unknown"
 	}
-	return []string{
-		sseEvent("response.output_item.added", map[string]any{
-			"output_index": outputIndex,
-			"item": map[string]any{
-				"type":    "reasoning",
-				"id":      itemID,
-				"status":  "in_progress",
-				"summary": []any{},
-			},
-		}),
-		sseEvent("response.reasoning_text.delta", map[string]any{
-			"item_id": itemID, "output_index": outputIndex,
-			"content_index": 0, "delta": c.reasoningText,
-		}),
+	return []string{sseEvent("response.output_item.added", map[string]any{
+		"output_index": outputIndex,
+		"item": map[string]any{
+			"type":    "reasoning",
+			"id":      itemID,
+			"status":  "in_progress",
+			"summary": []any{},
+		},
+	})}
+}
+
+func (c *StreamingConverter) ensureReasoningDelta() []string {
+	if c.reasoningText == "" {
+		return nil
 	}
+	events := c.ensureReasoningItem()
+	itemID := "rs_" + strings.TrimPrefix(c.responseID, "resp_")
+	if itemID == "rs_" {
+		itemID = "rs_unknown"
+	}
+	events = append(events, sseEvent("response.reasoning_text.delta", map[string]any{
+		"item_id": itemID, "output_index": 0,
+		"content_index": 0, "delta": c.reasoningText,
+	}))
+	return events
 }
 
 func (c *StreamingConverter) ensureInitialized(data map[string]any) []string {

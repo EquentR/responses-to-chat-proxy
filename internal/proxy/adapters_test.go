@@ -317,6 +317,45 @@ func TestChatStreamEOFWithoutFinishReasonProducesIncompleteOrFailed(t *testing.T
 	}
 }
 
+func TestConvertResponseEOFWithoutFinishReasonProducesIncompleteOrFailed(t *testing.T) {
+	withOutput := ConvertResponse(map[string]any{
+		"id":      "chatcmpl-abc",
+		"created": 123,
+		"model":   "test-model",
+		"choices": []any{
+			map[string]any{
+				"finish_reason": nil,
+				"message":       map[string]any{"role": "assistant", "content": "Hello"},
+			},
+		},
+	}, map[string]any{"model": "test-model", "input": "Hi"})
+	if withOutput["status"] != "incomplete" {
+		t.Fatalf("expected incomplete with substantive output, got %#v", withOutput["status"])
+	}
+	withOutputItem := withOutput["output"].([]any)[0].(map[string]any)
+	if withOutputItem["status"] == "in_progress" {
+		t.Fatalf("final response output item must not remain in_progress: %#v", withOutputItem)
+	}
+
+	empty := ConvertResponse(map[string]any{
+		"id":      "chatcmpl-empty",
+		"created": 123,
+		"model":   "test-model",
+		"choices": []any{
+			map[string]any{
+				"finish_reason": nil,
+				"message":       map[string]any{"role": "assistant", "content": ""},
+			},
+		},
+	}, map[string]any{"model": "test-model", "input": "Hi"})
+	if empty["status"] != "failed" {
+		t.Fatalf("expected failed without substantive output, got %#v", empty["status"])
+	}
+	if output := empty["output"].([]any); len(output) != 0 {
+		t.Fatalf("failed response without substantive output should not include empty in-progress output: %#v", output)
+	}
+}
+
 func TestConvertResponseNonStreaming(t *testing.T) {
 	converted := ConvertResponse(map[string]any{
 		"id":      "chatcmpl-abc",
@@ -397,6 +436,105 @@ func TestReasoningExtractionCoversObjectShapeAndThinkTags(t *testing.T) {
 	}
 }
 
+func TestConvertResponseReasoningContentPartDoesNotPolluteVisibleMessage(t *testing.T) {
+	converted := ConvertResponse(map[string]any{
+		"id":      "chatcmpl-abc",
+		"created": 123,
+		"model":   "test-model",
+		"choices": []any{
+			map[string]any{
+				"finish_reason": "stop",
+				"message": map[string]any{
+					"role": "assistant",
+					"content": []any{
+						map[string]any{"type": "reasoning", "summary": []any{map[string]any{"type": "summary_text", "text": "Hidden thought."}}},
+						map[string]any{"type": "text", "text": "<thinking>Tagged part.</thinking>Visible answer."},
+					},
+				},
+			},
+		},
+	}, map[string]any{"model": "test-model", "input": "Hello"})
+
+	output := converted["output"].([]any)
+	if len(output) != 2 {
+		t.Fatalf("unexpected output length: %#v", output)
+	}
+
+	reasoning := output[0].(map[string]any)
+	summary := reasoning["summary"].([]any)
+	if summary[0].(map[string]any)["text"] != "Hidden thought.\nTagged part." {
+		t.Fatalf("unexpected reasoning summary: %#v", summary)
+	}
+
+	message := output[1].(map[string]any)
+	content := message["content"].([]any)
+	if len(content) != 1 || content[0].(map[string]any)["text"] != "Visible answer." {
+		t.Fatalf("unexpected visible content: %#v", content)
+	}
+}
+
+func TestStreamingConverterHandlesReasoningObjectDeltas(t *testing.T) {
+	converter := NewStreamingConverter()
+	chunk := "data: " + mustJSON(map[string]any{
+		"id":      "chatcmpl-abc",
+		"created": 123,
+		"model":   "test-model",
+		"choices": []any{
+			map[string]any{
+				"delta": map[string]any{
+					"role":      "assistant",
+					"reasoning": map[string]any{"content": []any{map[string]any{"type": "reasoning_text", "text": "First thought. "}}},
+				},
+				"finish_reason": nil,
+			},
+		},
+	}) + "\n\n" + "data: " + mustJSON(map[string]any{
+		"id":      "chatcmpl-abc",
+		"created": 123,
+		"model":   "test-model",
+		"choices": []any{
+			map[string]any{
+				"delta": map[string]any{
+					"reasoning": map[string]any{"summary": []any{map[string]any{"type": "summary_text", "text": "Second thought."}}},
+					"content":   "Visible answer.",
+				},
+				"finish_reason": nil,
+			},
+		},
+	}) + "\n\n" + "data: " + mustJSON(map[string]any{
+		"id":      "chatcmpl-abc",
+		"created": 123,
+		"model":   "test-model",
+		"choices": []any{
+			map[string]any{"delta": map[string]any{}, "finish_reason": "stop"},
+		},
+	}) + "\n\n"
+
+	payloads := ssePayloads(converter.Feed([]byte(chunk)))
+	completed := findPayload(payloads, "response.completed")
+	if completed == nil {
+		t.Fatalf("missing response.completed payloads=%#v", payloads)
+	}
+
+	response := completed["response"].(map[string]any)
+	output := response["output"].([]any)
+	if len(output) != 2 {
+		t.Fatalf("unexpected output count: %#v", output)
+	}
+
+	reasoning := output[0].(map[string]any)
+	summary := reasoning["summary"].([]any)
+	if summary[0].(map[string]any)["text"] != "First thought. Second thought." {
+		t.Fatalf("unexpected reasoning summary: %#v", summary)
+	}
+
+	message := output[1].(map[string]any)
+	content := message["content"].([]any)
+	if content[0].(map[string]any)["text"] != "Visible answer." {
+		t.Fatalf("unexpected visible text: %#v", content)
+	}
+}
+
 func TestConvertRequestPreservesFunctionCallHistory(t *testing.T) {
 	converted := ConvertRequest(map[string]any{
 		"model": "test-model",
@@ -437,6 +575,41 @@ func TestConvertRequestPreservesFunctionCallHistory(t *testing.T) {
 	}
 
 	assertJSONEqual(t, want, converted["messages"])
+}
+
+func TestConvertRequestPreservesCustomToolSchema(t *testing.T) {
+	converted := ConvertRequest(map[string]any{
+		"model": "test-model",
+		"input": "Use the custom tool.",
+		"tools": []any{
+			map[string]any{
+				"type":        "custom",
+				"name":        "code_exec",
+				"description": "Run code in a sandbox.",
+				"input_schema": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"language": map[string]any{"type": "string"},
+						"code":     map[string]any{"type": "string"},
+					},
+					"required": []any{"language", "code"},
+				},
+			},
+		},
+	}, Config{})
+
+	tools := converted["tools"].([]any)
+	fn := tools[0].(map[string]any)["function"].(map[string]any)
+	params := fn["parameters"].(map[string]any)
+	props := params["properties"].(map[string]any)
+	input := props[customToolInputField].(map[string]any)
+	desc := input["description"].(string)
+
+	for _, want := range []string{"Run code in a sandbox.", "input_schema", "language", "code"} {
+		if !contains(desc, want) {
+			t.Fatalf("custom tool input description should preserve %q, got %q", want, desc)
+		}
+	}
 }
 
 func TestStreamingConverterTextDelta(t *testing.T) {
