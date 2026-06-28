@@ -155,10 +155,24 @@ func TestConvertResponsesToMessagesDoesNotEmitThinkingWithoutConfigOrRouteSuppor
 			"effort": "high",
 		},
 		"input": "Hello",
-	}, Config{}, RouteEntry{Features: []string{"text"}})
+	}, Config{}, RouteEntry{Features: []string{"text-only"}})
 
 	if _, ok := converted["thinking"]; ok {
 		t.Fatalf("unexpected thinking without explicit support: %#v", converted["thinking"])
+	}
+}
+
+func TestConvertResponsesToMessagesDoesNotEmitThinkingFromRouteReasoningTextAlone(t *testing.T) {
+	converted := ConvertResponsesToMessages(map[string]any{
+		"model": "claude-4",
+		"reasoning": map[string]any{
+			"effort": "high",
+		},
+		"input": "Hello",
+	}, Config{}, RouteEntry{Reasoning: "supports thinking.type gating"})
+
+	if _, ok := converted["thinking"]; ok {
+		t.Fatalf("unexpected thinking from free-form route reasoning text: %#v", converted["thinking"])
 	}
 }
 
@@ -183,7 +197,7 @@ func TestConvertResponsesToMessagesDowngradesMultimodalWhenRouteIsTextOnly(t *te
 				},
 			},
 		},
-	}, Config{}, RouteEntry{Features: []string{"text"}})
+	}, Config{}, RouteEntry{Features: []string{"text-only"}})
 
 	messages, _ := converted["messages"].([]any)
 	if len(messages) != 3 {
@@ -203,6 +217,78 @@ func TestConvertResponsesToMessagesDowngradesMultimodalWhenRouteIsTextOnly(t *te
 		text := content[0].(map[string]any)["text"].(string)
 		if !strings.Contains(text, want) {
 			t.Fatalf("expected downgraded text %q to contain %q", text, want)
+		}
+	}
+}
+
+func TestConvertResponsesToMessagesKeepsMultimodalWhenRouteFeaturesAreAmbiguous(t *testing.T) {
+	converted := ConvertResponsesToMessages(map[string]any{
+		"model": "claude-4",
+		"input": []any{
+			map[string]any{
+				"type":      "input_image",
+				"image_url": "https://example.com/image.png",
+			},
+			map[string]any{
+				"type":     "input_file",
+				"file_id":  "file-123",
+				"filename": "notes.txt",
+			},
+			map[string]any{
+				"type": "input_audio",
+				"input_audio": map[string]any{
+					"format": "mp3",
+					"data":   "QUJD",
+				},
+			},
+		},
+	}, Config{}, RouteEntry{Features: []string{"text"}})
+
+	messages, _ := converted["messages"].([]any)
+	if len(messages) != 3 {
+		t.Fatalf("expected three multimodal messages, got %#v", converted["messages"])
+	}
+
+	wantTypes := []string{"image", "document", "audio"}
+	for index, wantType := range wantTypes {
+		content, _ := messages[index].(map[string]any)["content"].([]any)
+		if len(content) != 1 || content[0].(map[string]any)["type"] != wantType {
+			t.Fatalf("expected %s block at index %d, got %#v", wantType, index, messages[index])
+		}
+	}
+}
+
+func TestConvertResponsesToMessagesDowngradesOnlyWithExplicitNegativeCapabilitySignals(t *testing.T) {
+	converted := ConvertResponsesToMessages(map[string]any{
+		"model": "claude-4",
+		"input": []any{
+			map[string]any{
+				"type":      "input_image",
+				"image_url": "https://example.com/image.png",
+			},
+			map[string]any{
+				"type":     "input_file",
+				"file_id":  "file-123",
+				"filename": "notes.txt",
+			},
+			map[string]any{
+				"type": "input_audio",
+				"input_audio": map[string]any{
+					"format": "mp3",
+					"data":   "QUJD",
+				},
+			},
+		},
+	}, Config{}, RouteEntry{Features: []string{"text-only", "no-image", "no-file", "no-audio"}})
+
+	messages, _ := converted["messages"].([]any)
+	if len(messages) != 3 {
+		t.Fatalf("expected three downgraded messages, got %#v", converted["messages"])
+	}
+	for index, raw := range messages {
+		content, _ := raw.(map[string]any)["content"].([]any)
+		if len(content) != 1 || content[0].(map[string]any)["type"] != "text" {
+			t.Fatalf("expected explicit negative capability downgrade at index %d, got %#v", index, raw)
 		}
 	}
 }
@@ -308,20 +394,28 @@ func TestConvertMessagesStreamToResponsesSSE(t *testing.T) {
 		"event: message_start\ndata: " + mustJSON(map[string]any{
 			"message": map[string]any{"id": "msg-123", "model": "claude-4", "role": "assistant"},
 		}) + "\n\n",
-		"event: content_block_start\ndata: " + mustJSON(map[string]any{
-			"index":         0,
-			"content_block": map[string]any{"type": "redacted_thinking", "data": "hidden-plan"},
+		"event: content_block_delta\ndata: " + mustJSON(map[string]any{
+			"index": 0,
+			"delta": map[string]any{"type": "thinking_delta", "thinking": "part1"},
+		}) + "\n\n",
+		"event: content_block_delta\ndata: " + mustJSON(map[string]any{
+			"index": 0,
+			"delta": map[string]any{"type": "thinking_delta", "thinking": "part2"},
 		}) + "\n\n",
 		"event: content_block_start\ndata: " + mustJSON(map[string]any{
 			"index":         1,
+			"content_block": map[string]any{"type": "redacted_thinking", "data": "hidden-plan"},
+		}) + "\n\n",
+		"event: content_block_start\ndata: " + mustJSON(map[string]any{
+			"index":         2,
 			"content_block": map[string]any{"type": "tool_use", "id": "toolu_1", "name": "shell"},
 		}) + "\n\n",
 		"event: content_block_delta\ndata: " + mustJSON(map[string]any{
-			"index": 1,
+			"index": 2,
 			"delta": map[string]any{"type": "input_json_delta", "partial_json": "{\"command\":\"pwd\"}"},
 		}) + "\n\n",
 		"event: content_block_delta\ndata: " + mustJSON(map[string]any{
-			"index": 2,
+			"index": 3,
 			"delta": map[string]any{"type": "text_delta", "text": "Hello"},
 		}) + "\n\n",
 		"event: message_delta\ndata: " + mustJSON(map[string]any{
@@ -360,7 +454,7 @@ func TestConvertMessagesStreamToResponsesSSE(t *testing.T) {
 		t.Fatalf("expected reasoning output first, got %#v", reasoning)
 	}
 	summary := reasoning["summary"].([]any)
-	if summary[0].(map[string]any)["text"] != "hidden-plan" {
+	if summary[0].(map[string]any)["text"] != "part1part2\nhidden-plan" {
 		t.Fatalf("expected redacted thinking summary to be preserved, got %#v", reasoning)
 	}
 

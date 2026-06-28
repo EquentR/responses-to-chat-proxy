@@ -511,7 +511,7 @@ func TestMessagesOnlyUpstreamUsesRouteFeaturesForThinkingAndDowngrade(t *testing
 		Protocol:   RouteProtocolMessages,
 		Endpoint:   "/v1/messages",
 		Confidence: RouteConfidenceExplicit,
-		Features:   []string{"text", "thinking"},
+		Features:   []string{"text-only", "thinking", "no-image", "no-audio"},
 	})
 
 	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{

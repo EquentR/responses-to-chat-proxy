@@ -293,43 +293,25 @@ func allowMessagesThinking(cfg Config, route RouteEntry) bool {
 	}
 
 	features := routeFeatureSet(route)
-	if hasAnyFeature(features, "thinking", "thinking_only", "thinking-only") {
-		return true
-	}
-
-	reasoning := strings.ToLower(strings.TrimSpace(route.Reasoning))
-	return strings.Contains(reasoning, "thinking_only") ||
-		strings.Contains(reasoning, "thinking.type") ||
-		strings.Contains(reasoning, "top-level thinking") ||
-		strings.Contains(reasoning, "supports thinking")
+	return hasAnyFeature(features, "thinking", "thinking_only", "thinking-only")
 }
 
 func shouldDowngradeMessagesInput(kind string, route RouteEntry) bool {
 	features := routeFeatureSet(route)
-	if !routeHasExplicitInputModalities(features) {
+	if !hasAnyFeature(features, "text-only", "text_only", "no-image", "no_file", "no-file", "no-audio", "no_audio", "no-document", "no_document", "no-documents", "no_documents", "no-files", "no_files", "no-vision") {
 		return false
 	}
 
 	switch kind {
 	case "image":
-		return !hasAnyFeature(features, "image", "vision", "multimodal", "multi-modal")
+		return hasAnyFeature(features, "text-only", "text_only", "no-image", "no_vision", "no-vision")
 	case "file":
-		return !hasAnyFeature(features, "file", "files", "document", "documents", "multimodal", "multi-modal")
+		return hasAnyFeature(features, "text-only", "text_only", "no-file", "no_file", "no-files", "no_files", "no-document", "no_document", "no-documents", "no_documents")
 	case "audio":
-		return !hasAnyFeature(features, "audio", "multimodal", "multi-modal")
+		return hasAnyFeature(features, "text-only", "text_only", "no-audio", "no_audio")
 	default:
 		return false
 	}
-}
-
-func routeHasExplicitInputModalities(features map[string]struct{}) bool {
-	return hasAnyFeature(features,
-		"text", "text-only", "text_only",
-		"image", "vision",
-		"file", "files", "document", "documents",
-		"audio",
-		"multimodal", "multi-modal",
-	)
 }
 
 func routeFeatureSet(route RouteEntry) map[string]struct{} {
@@ -1127,7 +1109,7 @@ func (c *MessagesStreamingConverter) handleContentBlockDelta(payload map[string]
 		if text == "" {
 			return nil
 		}
-		c.appendReasoning(text)
+		c.appendReasoningDelta(text)
 		return []string{sseEvent("response.reasoning_text.delta", map[string]any{
 			"item_id":       c.reasoningItemID(),
 			"output_index":  c.reasoningOutputIndexValue(),
@@ -1271,11 +1253,19 @@ func (c *MessagesStreamingConverter) collectReasoningBlock(block map[string]any)
 	}
 
 	for _, part := range parts {
-		c.appendReasoning(part)
+		c.appendReasoningBlock(part)
 	}
 }
 
-func (c *MessagesStreamingConverter) appendReasoning(text string) {
+func (c *MessagesStreamingConverter) appendReasoningDelta(text string) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return
+	}
+	c.reasoning.WriteString(text)
+}
+
+func (c *MessagesStreamingConverter) appendReasoningBlock(text string) {
 	text = strings.TrimSpace(text)
 	if text == "" {
 		return
