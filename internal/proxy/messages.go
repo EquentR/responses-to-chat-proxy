@@ -298,19 +298,19 @@ func allowMessagesThinking(cfg Config, route RouteEntry) bool {
 
 func shouldDowngradeMessagesInput(kind string, route RouteEntry) bool {
 	features := routeFeatureSet(route)
-	if !hasAnyFeature(features, "text-only", "text_only", "no-image", "no_file", "no-file", "no-audio", "no_audio", "no-document", "no_document", "no-documents", "no_documents", "no-files", "no_files", "no-vision") {
-		return false
-	}
+	return hasAnyFeature(features, messagesInputDowngradeTokens(kind)...)
+}
 
+func messagesInputDowngradeTokens(kind string) []string {
 	switch kind {
 	case "image":
-		return hasAnyFeature(features, "text-only", "text_only", "no-image", "no_vision", "no-vision")
+		return []string{"text-only", "text_only", "no-image", "no_vision", "no-vision"}
 	case "file":
-		return hasAnyFeature(features, "text-only", "text_only", "no-file", "no_file", "no-files", "no_files", "no-document", "no_document", "no-documents", "no_documents")
+		return []string{"text-only", "text_only", "no-file", "no_file", "no-files", "no_files", "no-document", "no_document", "no-documents", "no_documents"}
 	case "audio":
-		return hasAnyFeature(features, "text-only", "text_only", "no-audio", "no_audio")
+		return []string{"text-only", "text_only", "no-audio", "no_audio"}
 	default:
-		return false
+		return nil
 	}
 }
 

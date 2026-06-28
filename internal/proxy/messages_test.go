@@ -293,6 +293,27 @@ func TestConvertResponsesToMessagesDowngradesOnlyWithExplicitNegativeCapabilityS
 	}
 }
 
+func TestConvertResponsesToMessagesDowngradesImageWhenRouteHasNoVision(t *testing.T) {
+	converted := ConvertResponsesToMessages(map[string]any{
+		"model": "claude-4",
+		"input": []any{
+			map[string]any{
+				"type":      "input_image",
+				"image_url": "https://example.com/image.png",
+			},
+		},
+	}, Config{}, RouteEntry{Features: []string{"no_vision"}})
+
+	messages, _ := converted["messages"].([]any)
+	if len(messages) != 1 {
+		t.Fatalf("expected one downgraded message, got %#v", converted["messages"])
+	}
+	content, _ := messages[0].(map[string]any)["content"].([]any)
+	if len(content) != 1 || content[0].(map[string]any)["type"] != "text" {
+		t.Fatalf("expected no_vision to downgrade image input, got %#v", messages[0])
+	}
+}
+
 func TestConvertResponsesToMessagesNormalizesNestedAudioContent(t *testing.T) {
 	converted := ConvertResponsesToMessages(map[string]any{
 		"model": "claude-4",
