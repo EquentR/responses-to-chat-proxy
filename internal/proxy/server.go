@@ -111,7 +111,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 			s.forwardResponsesAsChat(w, r, body, route)
 			return
 		case RouteProtocolMessages:
-			s.writeUnsupportedProtocol(w, fmt.Sprintf("Responses to messages conversion is not supported for model %q.", model))
+			s.forwardResponsesAsMessages(w, r, body, route)
 			return
 		default:
 			s.writeUnsupportedProtocol(w, fmt.Sprintf("Model %q resolved to unsupported protocol %q.", model, route.Protocol))
@@ -138,6 +138,17 @@ func (s *Server) forwardResponsesAsChat(w http.ResponseWriter, r *http.Request, 
 	}
 
 	s.forwardConvertedResponse(w, r, body, chatRequest, s.routeEndpointURL(route, RouteProtocolChat))
+}
+
+func (s *Server) forwardResponsesAsMessages(w http.ResponseWriter, r *http.Request, body map[string]any, route RouteEntry) {
+	messagesRequest := ConvertResponsesToMessages(body, s.config)
+
+	if boolValue(messagesRequest["stream"]) {
+		s.streamMessages(w, r, body, messagesRequest, s.routeEndpointURL(route, RouteProtocolMessages))
+		return
+	}
+
+	s.forwardConvertedMessagesResponse(w, r, body, messagesRequest, s.routeEndpointURL(route, RouteProtocolMessages))
 }
 
 func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -389,6 +400,114 @@ func (s *Server) streamResponses(w http.ResponseWriter, r *http.Request, _ map[s
 		}
 
 		writeSSEChunks(w, flusher, sseError(readErr.Error(), "internal_error", "server_error"))
+		for _, event := range converter.Finish() {
+			writeSSEChunks(w, flusher, []byte(event))
+		}
+		return
+	}
+}
+
+func (s *Server) forwardConvertedMessagesResponse(w http.ResponseWriter, r *http.Request, originalRequest, messagesRequest map[string]any, endpointURL string) {
+	body, err := json.Marshal(messagesRequest)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errorPayload("Request conversion error.", "invalid_request_error", "conversion_error"))
+		return
+	}
+
+	response, err := s.doRequest(
+		r.Context(),
+		s.normalClient,
+		http.MethodPost,
+		endpointURL,
+		copyHeaders(r.Header, s.config.UpstreamAPIKey),
+		bytes.NewReader(body),
+	)
+	if err != nil {
+		s.writeUpstreamRequestError(w, err)
+		return
+	}
+	defer response.Body.Close()
+
+	responseData := parseResponseJSON(response)
+	if response.StatusCode >= http.StatusBadRequest {
+		writeJSON(w, response.StatusCode, NormalizeUpstreamError(responseData))
+		return
+	}
+
+	writeJSON(w, response.StatusCode, ConvertMessagesToResponses(responseData, originalRequest))
+}
+
+func (s *Server) streamMessages(w http.ResponseWriter, r *http.Request, originalRequest, messagesRequest map[string]any, endpointURL string) {
+	streamBody := cloneMap(messagesRequest)
+	streamBody["stream"] = true
+	body, err := json.Marshal(streamBody)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errorPayload("Request conversion error.", "invalid_request_error", "conversion_error"))
+		return
+	}
+
+	headers := copyHeaders(r.Header, s.config.UpstreamAPIKey)
+	headers.Set("Accept", "text/event-stream")
+
+	ctx, cancel := context.WithTimeout(r.Context(), s.config.StreamTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpointURL, bytes.NewReader(body))
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorPayload("Failed to build upstream request.", "server_error", "request_build_failed"))
+		return
+	}
+	req.Header = headers
+
+	resp, err := s.streamClient.Do(req)
+	if err != nil {
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache, no-transform")
+		w.Header().Set("X-Accel-Buffering", "no")
+		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
+		writeSSEChunks(w, flusher, sseError(fmt.Sprintf("Upstream request failed: %v", err), "upstream_request_failed"))
+		return
+	}
+	defer resp.Body.Close()
+
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache, no-transform")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+
+	flusher, _ := w.(http.Flusher)
+	converter := NewMessagesStreamingConverter(originalRequest)
+
+	if resp.StatusCode >= http.StatusBadRequest {
+		errorData := readStreamError(resp)
+		writeSSEChunks(w, flusher, sseError(extractErrorMessage(errorData), fmt.Sprintf("http_%d", resp.StatusCode)))
+		for _, event := range converter.Finish() {
+			writeSSEChunks(w, flusher, []byte(event))
+		}
+		return
+	}
+
+	buffer := make([]byte, 4096)
+	for {
+		n, readErr := resp.Body.Read(buffer)
+		if n > 0 {
+			for _, event := range converter.Feed(buffer[:n]) {
+				writeSSEChunks(w, flusher, []byte(event))
+			}
+		}
+
+		if readErr == nil {
+			continue
+		}
+		if errors.Is(readErr, io.EOF) {
+			for _, event := range converter.Finish() {
+				writeSSEChunks(w, flusher, []byte(event))
+			}
+			return
+		}
+
+		writeSSEChunks(w, flusher, sseError(fmt.Sprintf("Upstream request failed: %v", readErr), "upstream_request_failed"))
 		for _, event := range converter.Finish() {
 			writeSSEChunks(w, flusher, []byte(event))
 		}

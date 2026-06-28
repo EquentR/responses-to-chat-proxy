@@ -425,29 +425,65 @@ func TestResponsesRoutesToChatWhenChatOnly(t *testing.T) {
 	}
 }
 
-func TestResponsesRoutesToMessagesWhenMessagesOnly(t *testing.T) {
-	upstreamCalled := false
+func TestMessagesOnlyUpstreamCanServeResponsesRequests(t *testing.T) {
+	var upstreamPath string
+	var upstreamBody map[string]any
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upstreamCalled = true
-		t.Fatalf("messages conversion is unsupported and should not call upstream")
+		upstreamPath = r.URL.Path
+		if err := json.NewDecoder(r.Body).Decode(&upstreamBody); err != nil {
+			t.Fatalf("Decode upstream body returned error: %v", err)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":   "msg-abc",
+			"type": "message",
+			"role": "assistant",
+			"content": []any{
+				map[string]any{"type": "text", "text": "Hi"},
+			},
+			"usage": map[string]any{
+				"input_tokens":  4,
+				"output_tokens": 2,
+				"total_tokens":  6,
+			},
+		})
 	}))
 	defer upstream.Close()
 
 	server := newRouteAwareTestServer(upstream.URL+"/v1", "upstream-secret")
 	storeTestRoute(server, "messages-model", RouteProtocolMessages, "/v1/messages")
 
-	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"messages-model","input":"hello"}`))
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"messages-model","instructions":"Be brief.","input":"hello","max_output_tokens":20}`))
 	request.Header.Set("Content-Type", "application/json")
 	recorder := httptest.NewRecorder()
 
 	server.ServeHTTP(recorder, request)
 
-	if recorder.Code != http.StatusBadRequest {
+	if recorder.Code != http.StatusOK {
 		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
 	}
-	assertErrorTypeAndCode(t, recorder.Body.Bytes(), "invalid_request_error", "unsupported_protocol")
-	if upstreamCalled {
-		t.Fatal("expected unsupported messages conversion not to call upstream")
+	if upstreamPath != "/v1/messages" {
+		t.Fatalf("unexpected upstream path: %s", upstreamPath)
+	}
+	if upstreamBody["system"] != "Be brief." {
+		t.Fatalf("expected instructions to map to system, got %#v", upstreamBody["system"])
+	}
+	if upstreamBody["max_tokens"] != float64(20) {
+		t.Fatalf("expected max_output_tokens to map to max_tokens, got %#v", upstreamBody["max_tokens"])
+	}
+	messages, _ := upstreamBody["messages"].([]any)
+	if len(messages) != 1 {
+		t.Fatalf("expected one user message, got %#v", upstreamBody["messages"])
+	}
+	userMsg, _ := messages[0].(map[string]any)
+	if userMsg["role"] != "user" {
+		t.Fatalf("expected user role, got %#v", userMsg)
+	}
+	content, _ := userMsg["content"].([]any)
+	if len(content) != 1 || content[0].(map[string]any)["type"] != "text" {
+		t.Fatalf("expected text content block, got %#v", userMsg["content"])
+	}
+	if payload := recorder.Body.String(); !strings.Contains(payload, `"id":"resp-abc"`) {
+		t.Fatalf("expected converted responses payload, got %s", payload)
 	}
 }
 
@@ -513,7 +549,7 @@ func TestChatCompletionsPassesThroughOnlyWhenRouteIsChat(t *testing.T) {
 	}
 }
 
-func TestMessagesPassesThroughOnlyWhenRouteIsMessages(t *testing.T) {
+func TestMessagesEndpointCanPassThroughWhenUpstreamProtocolMatches(t *testing.T) {
 	t.Run("route messages passes through", func(t *testing.T) {
 		var upstreamPath string
 		var rawBody string
