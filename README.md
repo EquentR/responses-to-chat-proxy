@@ -32,6 +32,8 @@ ROUTE_DETECTION=lazy
 ROUTE_TABLE_TTL_SECONDS=1800
 ROUTE_TABLE_PERSIST=false
 ROUTE_PROBE_GENERATION=false
+CACHE_OPTIMIZER=false
+CACHE_OPTIMIZER_TTL=1h
 HOST=0.0.0.0
 PORT=8000
 REQUEST_TIMEOUT_SECONDS=120
@@ -46,6 +48,7 @@ If `UPSTREAM_API_KEY` is left empty, the proxy forwards the caller's `Authorizat
 ## Routing behavior
 
 - `POST /v1/responses` is the only entrypoint that can convert across upstream protocols.
+- In `ROUTE_DETECTION=lazy`, a cold route miss first refreshes `/models` metadata before the proxy decides whether to use native `responses`, convert to `chat`, or convert to `messages`.
 - When a model resolves to `responses`, the original request body is forwarded upstream without conversion.
 - When a model resolves to `chat`, the proxy converts Responses <-> Chat.
 - When a model resolves to `messages`, the proxy converts Responses <-> Messages.
@@ -61,6 +64,8 @@ If `UPSTREAM_API_KEY` is left empty, the proxy forwards the caller's `Authorizat
 - `ROUTE_TABLE_TTL_SECONDS`: in-memory route entry TTL. Default is `1800`.
 - `ROUTE_TABLE_PERSIST`: reserved for future persistence support. Default is `false`.
 - `ROUTE_PROBE_GENERATION`: whether protocol detection is allowed to fall back to minimal generation probes. Default is `false`.
+- `CACHE_OPTIMIZER`: injects `cache_control` breakpoints on Responses -> Chat converted requests. Default is `false`.
+- `CACHE_OPTIMIZER_TTL`: TTL used for injected cache breakpoints. Default is `1h`. Use `5m` to emit ephemeral breakpoints without an explicit TTL field.
 - `REASONING_MODE`: optional explicit override for Chat/Messages reasoning parameter mapping.
 
 ## Run locally

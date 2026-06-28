@@ -925,7 +925,7 @@ func mapMessagesStopReason(stopReason string, output []any) (string, map[string]
 		return "completed", nil
 	case "":
 		if hasSubstantiveResponseOutput(output) {
-			return "completed", nil
+			return "incomplete", nil
 		}
 		return "failed", nil
 	default:
@@ -947,10 +947,14 @@ type MessagesStreamingConverter struct {
 	createdAt   int
 	role        string
 	stopReason  string
+	sawMessageStop bool
 	text        strings.Builder
 	reasoning   strings.Builder
 	toolCalls   map[int]*messagesStreamToolCall
 	usage       map[string]any
+	nextOutputIndex int
+	messageOutputIndex *int
+	reasoningOutputIndex *int
 }
 
 type messagesStreamToolCall struct {
@@ -958,7 +962,7 @@ type messagesStreamToolCall struct {
 	name      string
 	args      strings.Builder
 	added     bool
-	outputIdx int
+	outputIdx *int
 }
 
 func NewMessagesStreamingConverter(originalReq map[string]any) *MessagesStreamingConverter {
@@ -1016,6 +1020,7 @@ func (c *MessagesStreamingConverter) processEvent(eventType string, payload map[
 	case "message_delta":
 		return c.handleMessageDelta(payload)
 	case "message_stop":
+		c.sawMessageStop = true
 		return c.finalEvents()
 	default:
 		if eventType == "" {
@@ -1066,7 +1071,7 @@ func (c *MessagesStreamingConverter) handleContentBlockStart(payload map[string]
 		if !entry.added {
 			entry.added = true
 			return []string{sseEvent("response.output_item.added", map[string]any{
-				"output_index": entry.outputIdx,
+				"output_index": valueOrDefault(entry.outputIdx, 0),
 				"item": map[string]any{
 					"type":      "function_call",
 					"id":        firstNonEmptyString(entry.id, toolCallFallbackID("fc_", responseSuffix(c.responseID), index)),
@@ -1122,7 +1127,7 @@ func (c *MessagesStreamingConverter) handleContentBlockDelta(payload map[string]
 			entry.args.WriteString(fragment)
 			return []string{sseEvent("response.function_call_arguments.delta", map[string]any{
 				"item_id":      firstNonEmptyString(entry.id, c.toolCallItemID(index)),
-				"output_index": entry.outputIdx,
+				"output_index": valueOrDefault(entry.outputIdx, 0),
 				"delta":        fragment,
 			})}
 		}
@@ -1151,7 +1156,7 @@ func (c *MessagesStreamingConverter) finalEvents() []string {
 		return nil
 	}
 	output := c.buildOutput()
-	status, incomplete := mapMessagesStopReason(c.stopReason, output)
+	status, incomplete := c.finalStatus(output)
 	events := append(c.ensureInitializationEvents(), sseEvent("response.completed", map[string]any{
 		"response": map[string]any{
 			"id":                  c.responseID,
@@ -1192,19 +1197,29 @@ func (c *MessagesStreamingConverter) ensureInitializationEvents() []string {
 }
 
 func (c *MessagesStreamingConverter) buildOutput() []any {
-	var output []any
+	type indexedOutputItem struct {
+		index int
+		item  map[string]any
+	}
+
+	var indexed []indexedOutputItem
 	if reasoning := strings.TrimSpace(c.reasoning.String()); reasoning != "" {
-		output = append(output, map[string]any{
+		indexed = append(indexed, indexedOutputItem{
+			index: c.reasoningOutputIndexValue(),
+			item: map[string]any{
 			"type":   "reasoning",
 			"id":     c.reasoningItemID(),
 			"status": "completed",
 			"summary": []any{
 				map[string]any{"type": "summary_text", "text": reasoning},
 			},
+		},
 		})
 	}
 	if text := strings.TrimSpace(c.text.String()); text != "" {
-		output = append(output, map[string]any{
+		indexed = append(indexed, indexedOutputItem{
+			index: c.messageOutputIndexValue(),
+			item: map[string]any{
 			"type":   "message",
 			"id":     c.messageItemID(),
 			"status": "completed",
@@ -1212,6 +1227,7 @@ func (c *MessagesStreamingConverter) buildOutput() []any {
 			"content": []any{
 				map[string]any{"type": "output_text", "text": text, "annotations": []any{}},
 			},
+		},
 		})
 	}
 
@@ -1226,15 +1242,29 @@ func (c *MessagesStreamingConverter) buildOutput() []any {
 		if args == "" {
 			args = "{}"
 		}
-		item := map[string]any{
-			"type":      "function_call",
-			"id":        firstNonEmptyString(entry.id, c.toolCallItemID(index)),
-			"call_id":   firstNonEmptyString(entry.id, c.toolCallItemID(index)),
-			"status":    "completed",
-			"name":      entry.name,
-			"arguments": args,
+		if entry.outputIdx == nil {
+			continue
 		}
-		output = append(output, item)
+		indexed = append(indexed, indexedOutputItem{
+			index: *entry.outputIdx,
+			item: map[string]any{
+				"type":      "function_call",
+				"id":        firstNonEmptyString(entry.id, c.toolCallItemID(index)),
+				"call_id":   firstNonEmptyString(entry.id, c.toolCallItemID(index)),
+				"status":    "completed",
+				"name":      entry.name,
+				"arguments": args,
+			},
+		})
+	}
+
+	sort.SliceStable(indexed, func(i, j int) bool {
+		return indexed[i].index < indexed[j].index
+	})
+
+	output := make([]any, 0, len(indexed))
+	for _, item := range indexed {
+		output = append(output, item.item)
 	}
 	return output
 }
@@ -1262,6 +1292,7 @@ func (c *MessagesStreamingConverter) appendReasoningDelta(text string) {
 	if text == "" {
 		return
 	}
+	_ = c.reasoningOutputIndexValue()
 	c.reasoning.WriteString(text)
 }
 
@@ -1270,6 +1301,7 @@ func (c *MessagesStreamingConverter) appendReasoningBlock(text string) {
 	if text == "" {
 		return
 	}
+	_ = c.reasoningOutputIndexValue()
 	if c.reasoning.Len() > 0 {
 		c.reasoning.WriteString("\n")
 	}
@@ -1279,11 +1311,9 @@ func (c *MessagesStreamingConverter) appendReasoningBlock(text string) {
 func (c *MessagesStreamingConverter) ensureToolCall(index int) *messagesStreamToolCall {
 	entry, ok := c.toolCalls[index]
 	if !ok {
-		entry = &messagesStreamToolCall{outputIdx: len(c.toolCalls)}
+		outputIdx := c.allocateOutputIndex()
+		entry = &messagesStreamToolCall{outputIdx: &outputIdx}
 		c.toolCalls[index] = entry
-	}
-	if entry.outputIdx == 0 && len(c.toolCalls) > 1 {
-		entry.outputIdx = len(c.toolCalls) - 1
 	}
 	return entry
 }
@@ -1297,15 +1327,42 @@ func (c *MessagesStreamingConverter) reasoningItemID() string {
 }
 
 func (c *MessagesStreamingConverter) messageOutputIndexValue() int {
-	return 0
+	if c.messageOutputIndex == nil {
+		outputIdx := c.allocateOutputIndex()
+		c.messageOutputIndex = &outputIdx
+	}
+	return *c.messageOutputIndex
 }
 
 func (c *MessagesStreamingConverter) reasoningOutputIndexValue() int {
-	return 1
+	if c.reasoningOutputIndex == nil {
+		outputIdx := c.allocateOutputIndex()
+		c.reasoningOutputIndex = &outputIdx
+	}
+	return *c.reasoningOutputIndex
 }
 
 func (c *MessagesStreamingConverter) toolCallItemID(index int) string {
 	return toolCallFallbackID("fc_", responseSuffix(c.responseID), index)
+}
+
+func (c *MessagesStreamingConverter) allocateOutputIndex() int {
+	outputIdx := c.nextOutputIndex
+	c.nextOutputIndex++
+	return outputIdx
+}
+
+func (c *MessagesStreamingConverter) finalStatus(output []any) (string, map[string]any) {
+	if c.stopReason != "" {
+		return mapMessagesStopReason(c.stopReason, output)
+	}
+	if c.sawMessageStop {
+		return "completed", nil
+	}
+	if hasSubstantiveResponseOutput(output) {
+		return "incomplete", nil
+	}
+	return "failed", nil
 }
 
 func parseMessagesSSEEvent(rawEvent string) (string, map[string]any) {

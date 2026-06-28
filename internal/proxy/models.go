@@ -78,7 +78,18 @@ type modelDiscoveryError struct {
 	message    string
 }
 
+type modelDiscoveryNoEvidenceError struct {
+	message string
+}
+
 func (e *modelDiscoveryError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return e.message
+}
+
+func (e *modelDiscoveryNoEvidenceError) Error() string {
 	if e == nil {
 		return ""
 	}
@@ -119,7 +130,7 @@ func discoverModelSelection(ctx context.Context, client *http.Client, cfg Config
 
 	candidates := modelDiscoveryCandidates(cfg.UpstreamBaseURL, cfg.UpstreamModelsURL)
 	if len(candidates) == 0 {
-		return modelDiscoverySelection{}, errors.New("models discovery has no endpoint candidates")
+		return modelDiscoverySelection{}, &modelDiscoveryNoEvidenceError{message: "models discovery has no endpoint candidates"}
 	}
 
 	var lastErr error
@@ -163,12 +174,12 @@ func discoverModelSelection(ctx context.Context, client *http.Client, cfg Config
 		return modelDiscoverySelection{}, lastParseErr
 	}
 	if sawEmptyPage {
-		return modelDiscoverySelection{}, errors.New("models discovery returned no models from any candidate")
+		return modelDiscoverySelection{}, &modelDiscoveryNoEvidenceError{message: "models discovery returned no models from any candidate"}
 	}
 	if lastErr != nil {
-		return modelDiscoverySelection{}, lastErr
+		return modelDiscoverySelection{}, &modelDiscoveryNoEvidenceError{message: lastErr.Error()}
 	}
-	return modelDiscoverySelection{}, errors.New("models discovery failed")
+	return modelDiscoverySelection{}, &modelDiscoveryNoEvidenceError{message: "models discovery failed"}
 }
 
 func ApplyDiscoveredModels(table *RouteTable, identity RouteIdentity, results []ModelDiscoveryResult) {

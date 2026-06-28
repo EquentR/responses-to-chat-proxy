@@ -28,6 +28,7 @@ type Config struct {
 	VerifySSL             bool
 	LogLevel              string
 	CacheOptimizer        bool // inject cache_control breakpoints
+	CacheOptimizerTTL     string
 	RequestTimeoutSeconds float64
 	StreamTimeoutSeconds  float64
 }
@@ -57,6 +58,8 @@ func LoadConfigFromEnv(dotEnvPath string) (Config, error) {
 		RouteTableTTLSeconds: envFloat("ROUTE_TABLE_TTL_SECONDS", defaultRouteTableTTLSeconds),
 		RouteTablePersist:    envBool("ROUTE_TABLE_PERSIST", false),
 		RouteProbeGeneration: envBool("ROUTE_PROBE_GENERATION", defaultRouteProbeGeneration),
+		CacheOptimizer:       envBool("CACHE_OPTIMIZER", false),
+		CacheOptimizerTTL:    envString("CACHE_OPTIMIZER_TTL", "1h"),
 	}
 
 	cfg.UpstreamBaseURL = normalizeUpstreamBaseURL(cfg.UpstreamBaseURL)
@@ -64,12 +67,21 @@ func LoadConfigFromEnv(dotEnvPath string) (Config, error) {
 	cfg.StreamTimeout = secondsToDuration(cfg.StreamTimeoutSeconds)
 	cfg.RouteTableTTLSeconds = normalizeRouteTableTTLSeconds(cfg.RouteTableTTLSeconds)
 	cfg.RouteTableTTL = secondsToDuration(cfg.RouteTableTTLSeconds)
+	cfg.CacheOptimizerTTL = normalizeCacheOptimizerTTL(cfg.CacheOptimizerTTL)
 
 	if cfg.UpstreamBaseURL == "" {
 		return Config{}, errors.New("UPSTREAM_BASE_URL must not be empty")
 	}
 
 	return cfg, nil
+}
+
+func normalizeCacheOptimizerTTL(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "1h"
+	}
+	return value
 }
 
 func loadDotEnv(path string) error {

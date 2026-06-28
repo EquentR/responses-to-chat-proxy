@@ -947,6 +947,130 @@ func TestStreamingConverterAppendsDoneSentinelAfterCompletion(t *testing.T) {
 	}
 }
 
+func TestStreamingConverterAddsMonotonicSequenceNumbers(t *testing.T) {
+	converter := NewStreamingConverter()
+	chunk := "data: " + mustJSON(map[string]any{
+		"id":      "chatcmpl-abc",
+		"created": 123,
+		"model":   "test-model",
+		"choices": []any{
+			map[string]any{
+				"delta": map[string]any{
+					"role":              "assistant",
+					"reasoning_content": "Hidden thought.",
+					"content":           "Visible answer.",
+				},
+				"finish_reason": nil,
+			},
+		},
+	}) + "\n\n" + "data: " + mustJSON(map[string]any{
+		"id":      "chatcmpl-abc",
+		"created": 123,
+		"model":   "test-model",
+		"choices": []any{
+			map[string]any{"delta": map[string]any{}, "finish_reason": "stop"},
+		},
+	}) + "\n\n"
+
+	payloads := ssePayloads(converter.Feed([]byte(chunk)))
+	if len(payloads) == 0 {
+		t.Fatal("expected SSE payloads")
+	}
+
+	prev := -1
+	for _, payload := range payloads {
+		raw, ok := payload["sequence_number"]
+		if !ok {
+			t.Fatalf("missing sequence_number on payload %#v", payload)
+		}
+		current := intValue(raw)
+		if current <= prev {
+			t.Fatalf("expected monotonic sequence numbers, got prev=%d current=%d payloads=%#v", prev, current, payloads)
+		}
+		prev = current
+	}
+}
+
+func TestStreamingConverterEmitsReasoningSummaryPartDone(t *testing.T) {
+	converter := NewStreamingConverter()
+	chunk := "data: " + mustJSON(map[string]any{
+		"id":      "chatcmpl-abc",
+		"created": 123,
+		"model":   "test-model",
+		"choices": []any{
+			map[string]any{
+				"delta": map[string]any{
+					"role":              "assistant",
+					"reasoning_content": "Hidden thought.",
+				},
+				"finish_reason": nil,
+			},
+		},
+	}) + "\n\n" + "data: " + mustJSON(map[string]any{
+		"id":      "chatcmpl-abc",
+		"created": 123,
+		"model":   "test-model",
+		"choices": []any{
+			map[string]any{"delta": map[string]any{}, "finish_reason": "stop"},
+		},
+	}) + "\n\n"
+
+	payloads := ssePayloads(converter.Feed([]byte(chunk)))
+	partDone := findPayload(payloads, "response.reasoning_summary_part.done")
+	if partDone == nil {
+		t.Fatalf("missing response.reasoning_summary_part.done payloads=%#v", payloads)
+	}
+	if partDone["summary_index"] != float64(0) {
+		t.Fatalf("unexpected summary_index: %#v", partDone)
+	}
+	part := partDone["part"].(map[string]any)
+	if part["type"] != "summary_text" || part["text"] != "Hidden thought." {
+		t.Fatalf("unexpected summary part done payload: %#v", partDone)
+	}
+}
+
+func TestStreamingConverterEventOrderMatchesNativeResponsesShape(t *testing.T) {
+	converter := NewStreamingConverter()
+	chunk := "data: " + mustJSON(map[string]any{
+		"id":      "chatcmpl-abc",
+		"created": 123,
+		"model":   "test-model",
+		"choices": []any{
+			map[string]any{
+				"delta": map[string]any{
+					"role":              "assistant",
+					"reasoning_content": "Hidden thought.",
+				},
+				"finish_reason": nil,
+			},
+		},
+	}) + "\n\n" + "data: " + mustJSON(map[string]any{
+		"id":      "chatcmpl-abc",
+		"created": 123,
+		"model":   "test-model",
+		"choices": []any{
+			map[string]any{"delta": map[string]any{}, "finish_reason": "stop"},
+		},
+	}) + "\n\n"
+
+	payloads := ssePayloads(converter.Feed([]byte(chunk)))
+	var types []string
+	for _, payload := range payloads {
+		types = append(types, stringValue(payload["type"]))
+	}
+
+	textDone := indexOfString(types, "response.reasoning_summary_text.done")
+	partDone := indexOfString(types, "response.reasoning_summary_part.done")
+	itemDone := indexOfString(types, "response.output_item.done")
+	completed := indexOfString(types, "response.completed")
+	if textDone < 0 || partDone < 0 || itemDone < 0 || completed < 0 {
+		t.Fatalf("missing expected reasoning lifecycle events: %#v", types)
+	}
+	if !(textDone < partDone && partDone < itemDone && itemDone < completed) {
+		t.Fatalf("unexpected reasoning lifecycle order: %#v", types)
+	}
+}
+
 func TestStreamingConverterStripsSplitThinkBlocksAcrossChunks(t *testing.T) {
 	converter := NewStreamingConverter()
 	first := ssePayloads(converter.Feed([]byte("data: " + mustJSON(map[string]any{
@@ -1130,7 +1254,7 @@ func TestStreamingConverterOrdersFinalDoneEventsAndCompletedOutputByOutputIndex(
 			doneIndexes = append(doneIndexes, intValue(payload["output_index"]))
 		}
 	}
-	wantDoneIndexes := []int{0, 0, 0, 1, 1, 2, 2}
+	wantDoneIndexes := []int{0, 0, 0, 1, 1, 2, 2, 2}
 	if len(doneIndexes) != len(wantDoneIndexes) {
 		t.Fatalf("unexpected done index count: got %v want %v", doneIndexes, wantDoneIndexes)
 	}
@@ -1460,6 +1584,15 @@ func assertContains(t *testing.T, haystack, needle string) {
 	if !contains(haystack, needle) {
 		t.Fatalf("expected %q to contain %q", haystack, needle)
 	}
+}
+
+func indexOfString(values []string, want string) int {
+	for index, value := range values {
+		if value == want {
+			return index
+		}
+	}
+	return -1
 }
 
 func contains(haystack, needle string) bool {

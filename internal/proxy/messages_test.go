@@ -470,26 +470,32 @@ func TestConvertMessagesStreamToResponsesSSE(t *testing.T) {
 		t.Fatalf("expected reasoning, message, and tool call in completed output, got %#v", output)
 	}
 
-	reasoning := output[0].(map[string]any)
-	if reasoning["type"] != "reasoning" {
-		t.Fatalf("expected reasoning output first, got %#v", reasoning)
+	var reasoning map[string]any
+	var message map[string]any
+	var toolCall map[string]any
+	for _, raw := range output {
+		item := raw.(map[string]any)
+		switch item["type"] {
+		case "reasoning":
+			reasoning = item
+		case "message":
+			message = item
+		case "function_call":
+			toolCall = item
+		}
+	}
+	if reasoning == nil || message == nil || toolCall == nil {
+		t.Fatalf("expected reasoning, message, and tool call outputs, got %#v", output)
 	}
 	summary := reasoning["summary"].([]any)
 	if summary[0].(map[string]any)["text"] != "part1part2\nhidden-plan" {
 		t.Fatalf("expected redacted thinking summary to be preserved, got %#v", reasoning)
 	}
-
-	message := output[1].(map[string]any)
-	if message["type"] != "message" {
-		t.Fatalf("expected message output second, got %#v", message)
-	}
 	content := message["content"].([]any)
 	if content[0].(map[string]any)["text"] != "Hello" {
 		t.Fatalf("expected final message text, got %#v", message)
 	}
-
-	toolCall := output[2].(map[string]any)
-	if toolCall["type"] != "function_call" || toolCall["call_id"] != "toolu_1" {
+	if toolCall["call_id"] != "toolu_1" {
 		t.Fatalf("expected completed function call output, got %#v", toolCall)
 	}
 	if toolCall["arguments"] != "{\"command\":\"pwd\"}" {
@@ -503,5 +509,212 @@ func TestConvertMessagesStreamToResponsesSSE(t *testing.T) {
 	outputDetails := usage["output_tokens_details"].(map[string]any)
 	if outputDetails["reasoning_tokens"] != float64(3) {
 		t.Fatalf("expected reasoning tokens in usage details, got %#v", usage)
+	}
+}
+
+func TestMessagesStreamEOFWithoutStopReasonProducesIncompleteOrFailed(t *testing.T) {
+	t.Run("substantive output becomes incomplete", func(t *testing.T) {
+		converter := NewMessagesStreamingConverter(map[string]any{"model": "claude-4"})
+		events := converter.Feed([]byte("event: message_start\ndata: " + mustJSON(map[string]any{
+			"message": map[string]any{"id": "msg-123", "model": "claude-4", "role": "assistant"},
+		}) + "\n\n"))
+		events = append(events, converter.Feed([]byte("event: content_block_delta\ndata: " + mustJSON(map[string]any{
+			"index": 0,
+			"delta": map[string]any{"type": "text_delta", "text": "Hello"},
+		}) + "\n\n"))...)
+		events = append(events, converter.Finish()...)
+
+		completed := findPayload(ssePayloads(events), "response.completed")
+		if completed == nil {
+			t.Fatalf("missing response.completed payloads=%#v", events)
+		}
+		response := completed["response"].(map[string]any)
+		if response["status"] != "incomplete" {
+			t.Fatalf("expected incomplete status, got %#v", response["status"])
+		}
+	})
+
+	t.Run("no output becomes failed", func(t *testing.T) {
+		converter := NewMessagesStreamingConverter(map[string]any{"model": "claude-4"})
+		events := converter.Finish()
+		completed := findPayload(ssePayloads(events), "response.completed")
+		if completed == nil {
+			t.Fatalf("missing response.completed payloads=%#v", events)
+		}
+		response := completed["response"].(map[string]any)
+		if response["status"] != "failed" {
+			t.Fatalf("expected failed status, got %#v", response["status"])
+		}
+	})
+}
+
+func TestMessagesStreamExplicitStopReasonProducesCompleted(t *testing.T) {
+	converter := NewMessagesStreamingConverter(map[string]any{"model": "claude-4"})
+	events := converter.Feed([]byte("event: message_start\ndata: " + mustJSON(map[string]any{
+		"message": map[string]any{"id": "msg-123", "model": "claude-4", "role": "assistant"},
+	}) + "\n\n"))
+	events = append(events, converter.Feed([]byte("event: content_block_delta\ndata: " + mustJSON(map[string]any{
+		"index": 0,
+		"delta": map[string]any{"type": "text_delta", "text": "Hello"},
+	}) + "\n\n"))...)
+	events = append(events, converter.Feed([]byte("event: message_delta\ndata: " + mustJSON(map[string]any{
+		"delta": map[string]any{"stop_reason": "end_turn"},
+	}) + "\n\n"))...)
+	events = append(events, converter.Feed([]byte("event: message_stop\ndata: {}\n\n"))...)
+
+	completed := findPayload(ssePayloads(events), "response.completed")
+	if completed == nil {
+		t.Fatalf("missing response.completed payloads=%#v", events)
+	}
+	response := completed["response"].(map[string]any)
+	if response["status"] != "completed" {
+		t.Fatalf("expected completed status, got %#v", response["status"])
+	}
+}
+
+func TestConvertMessagesStreamToResponsesSSEOutputIndexesMatchCompletedOutput(t *testing.T) {
+	converter := NewMessagesStreamingConverter(map[string]any{"model": "claude-4"})
+	events := []string{
+		"event: message_start\ndata: " + mustJSON(map[string]any{
+			"message": map[string]any{"id": "msg-123", "model": "claude-4", "role": "assistant"},
+		}) + "\n\n",
+		"event: content_block_delta\ndata: " + mustJSON(map[string]any{
+			"index": 0,
+			"delta": map[string]any{"type": "thinking_delta", "thinking": "reasoning"},
+		}) + "\n\n",
+		"event: content_block_start\ndata: " + mustJSON(map[string]any{
+			"index":         1,
+			"content_block": map[string]any{"type": "tool_use", "id": "toolu_1", "name": "shell"},
+		}) + "\n\n",
+		"event: content_block_delta\ndata: " + mustJSON(map[string]any{
+			"index": 1,
+			"delta": map[string]any{"type": "input_json_delta", "partial_json": "{\"command\":\"pwd\"}"},
+		}) + "\n\n",
+		"event: content_block_delta\ndata: " + mustJSON(map[string]any{
+			"index": 2,
+			"delta": map[string]any{"type": "text_delta", "text": "Hello"},
+		}) + "\n\n",
+		"event: message_delta\ndata: " + mustJSON(map[string]any{
+			"delta": map[string]any{"stop_reason": "end_turn"},
+		}) + "\n\n",
+		"event: message_stop\ndata: {}\n\n",
+	}
+
+	var out []string
+	for _, event := range events {
+		out = append(out, converter.Feed([]byte(event))...)
+	}
+	payloads := ssePayloads(out)
+	completed := findPayload(payloads, "response.completed")
+	if completed == nil {
+		t.Fatalf("missing response.completed payloads=%#v", payloads)
+	}
+
+	response := completed["response"].(map[string]any)
+	output := response["output"].([]any)
+	indexByID := map[string]int{}
+	for index, raw := range output {
+		item := raw.(map[string]any)
+		indexByID[stringValue(item["id"])] = index
+	}
+
+	for _, payload := range payloads {
+		switch payload["type"] {
+		case "response.reasoning_text.delta", "response.output_text.delta", "response.output_item.added", "response.function_call_arguments.delta":
+			itemID := stringValue(payload["item_id"])
+			if itemID == "" {
+				if item, ok := payload["item"].(map[string]any); ok {
+					itemID = stringValue(item["id"])
+				}
+			}
+			if itemID == "" {
+				t.Fatalf("missing item id on payload %#v", payload)
+			}
+			wantIndex, ok := indexByID[itemID]
+			if !ok {
+				t.Fatalf("completed output missing item %q in %#v", itemID, output)
+			}
+			if got := intValue(payload["output_index"]); got != wantIndex {
+				t.Fatalf("payload index mismatch for %q: got %d want %d payload=%#v output=%#v", itemID, got, wantIndex, payload, output)
+			}
+		}
+	}
+}
+
+func TestMessagesStreamReasoningMessageAndToolIndexesRemainStable(t *testing.T) {
+	converter := NewMessagesStreamingConverter(map[string]any{"model": "claude-4"})
+	events := []string{
+		"event: message_start\ndata: " + mustJSON(map[string]any{
+			"message": map[string]any{"id": "msg-123", "model": "claude-4", "role": "assistant"},
+		}) + "\n\n",
+		"event: content_block_delta\ndata: " + mustJSON(map[string]any{
+			"index": 0,
+			"delta": map[string]any{"type": "thinking_delta", "thinking": "part1"},
+		}) + "\n\n",
+		"event: content_block_delta\ndata: " + mustJSON(map[string]any{
+			"index": 0,
+			"delta": map[string]any{"type": "thinking_delta", "thinking": "part2"},
+		}) + "\n\n",
+		"event: content_block_start\ndata: " + mustJSON(map[string]any{
+			"index":         1,
+			"content_block": map[string]any{"type": "tool_use", "id": "toolu_1", "name": "shell"},
+		}) + "\n\n",
+		"event: content_block_delta\ndata: " + mustJSON(map[string]any{
+			"index": 1,
+			"delta": map[string]any{"type": "input_json_delta", "partial_json": "{\"command\":\"pwd\"}"},
+		}) + "\n\n",
+		"event: content_block_delta\ndata: " + mustJSON(map[string]any{
+			"index": 2,
+			"delta": map[string]any{"type": "text_delta", "text": "Hello"},
+		}) + "\n\n",
+		"event: content_block_delta\ndata: " + mustJSON(map[string]any{
+			"index": 2,
+			"delta": map[string]any{"type": "text_delta", "text": " again"},
+		}) + "\n\n",
+		"event: message_delta\ndata: " + mustJSON(map[string]any{
+			"delta": map[string]any{"stop_reason": "end_turn"},
+		}) + "\n\n",
+		"event: message_stop\ndata: {}\n\n",
+	}
+
+	var out []string
+	for _, event := range events {
+		out = append(out, converter.Feed([]byte(event))...)
+	}
+
+	payloads := ssePayloads(out)
+	indexes := map[string]int{}
+	for _, payload := range payloads {
+		switch payload["type"] {
+		case "response.reasoning_text.delta", "response.output_text.delta", "response.function_call_arguments.delta":
+			itemID := stringValue(payload["item_id"])
+			got := intValue(payload["output_index"])
+			if want, ok := indexes[itemID]; ok && want != got {
+				t.Fatalf("output_index changed for %q: got %d want %d payloads=%#v", itemID, got, want, payloads)
+			}
+			indexes[itemID] = got
+		case "response.output_item.added":
+			item := payload["item"].(map[string]any)
+			itemID := stringValue(item["id"])
+			got := intValue(payload["output_index"])
+			if want, ok := indexes[itemID]; ok && want != got {
+				t.Fatalf("output_index changed for %q: got %d want %d payloads=%#v", itemID, got, want, payloads)
+			}
+			indexes[itemID] = got
+		}
+	}
+
+	completed := findPayload(payloads, "response.completed")
+	if completed == nil {
+		t.Fatalf("missing response.completed payloads=%#v", payloads)
+	}
+	response := completed["response"].(map[string]any)
+	output := response["output"].([]any)
+	for index, raw := range output {
+		item := raw.(map[string]any)
+		itemID := stringValue(item["id"])
+		if got, ok := indexes[itemID]; !ok || got != index {
+			t.Fatalf("completed output index mismatch for %q: got %d want %d output=%#v indexes=%#v", itemID, got, index, output, indexes)
+		}
 	}
 }

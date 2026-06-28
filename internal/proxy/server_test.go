@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -60,6 +61,26 @@ func storeTestRoute(server *Server, model string, protocol RouteProtocol, endpoi
 		Endpoint:   endpoint,
 		Confidence: RouteConfidenceExplicit,
 	})
+}
+
+type recordingResolver struct {
+	route RouteEntry
+	ok    bool
+	err   error
+	calls []resolverInvocation
+}
+
+type resolverInvocation struct {
+	entrypoint RouteProtocol
+	model      string
+}
+
+func (r *recordingResolver) ResolveRoute(_ context.Context, _ http.Header, model string, entrypoint RouteProtocol) (RouteEntry, bool, error) {
+	r.calls = append(r.calls, resolverInvocation{entrypoint: entrypoint, model: model})
+	if r.err != nil {
+		return RouteEntry{}, false, r.err
+	}
+	return r.route, r.ok, nil
 }
 
 func TestPassthroughStreamRoutesRawResponsesSSEAndFlushesChunks(t *testing.T) {
@@ -187,7 +208,36 @@ func TestPassthroughStreamRoutesMessagesSSEAndHandlesUpstream4xx(t *testing.T) {
 		assertContains(t, recorder.Body.String(), "event: error")
 		assertContains(t, recorder.Body.String(), "\"message\":\"nope\"")
 		assertContains(t, recorder.Body.String(), "\"code\":\"http_400\"")
+		assertContains(t, recorder.Body.String(), "data: [DONE]")
 	})
+}
+
+func TestResponsesNativeStream4xxUsesSameTerminationContract(t *testing.T) {
+	server := newRouteAwareTestServer("https://upstream.example/v1", "upstream-secret")
+	storeTestRoute(server, "responses-model", RouteProtocolResponses, "/v1/responses")
+	server.streamClient = &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path != "/v1/responses" {
+			t.Fatalf("unexpected path: %s", req.URL.Path)
+		}
+		return &http.Response{
+			StatusCode: http.StatusBadRequest,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"responses nope"}}`)),
+		}, nil
+	})}
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"responses-model","input":"hello","stream":true}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
+
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	assertContains(t, recorder.Body.String(), "event: error")
+	assertContains(t, recorder.Body.String(), "\"message\":\"responses nope\"")
+	assertContains(t, recorder.Body.String(), "data: [DONE]")
 }
 
 func TestJoinUpstreamEndpoint(t *testing.T) {
@@ -289,6 +339,22 @@ func TestHealthEndpoint(t *testing.T) {
 	assertContains(t, recorder.Body.String(), `"status":"ok"`)
 }
 
+func TestCopyHeadersDoesNotDuplicateContentType(t *testing.T) {
+	incoming := http.Header{}
+	incoming.Add("Content-Type", "application/json")
+	incoming.Add("User-Agent", "codex-test")
+
+	headers := copyHeaders(incoming, "")
+
+	values := headers.Values("Content-Type")
+	if len(values) != 1 || values[0] != "application/json" {
+		t.Fatalf("unexpected content-type values: %#v", values)
+	}
+	if got := headers.Get("User-Agent"); got != "codex-test" {
+		t.Fatalf("unexpected user agent: %q", got)
+	}
+}
+
 func TestResponsesEndpointConvertsUpstreamResponse(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/chat/completions" {
@@ -318,6 +384,7 @@ func TestResponsesEndpointConvertsUpstreamResponse(t *testing.T) {
 		UpstreamAPIKey:  "upstream-secret",
 		RequestTimeout:  secondsToDuration(5),
 		StreamTimeout:   secondsToDuration(5),
+		RouteDetection:  RouteDetectionOff,
 		VerifySSL:       true,
 	})
 
@@ -422,6 +489,532 @@ func TestResponsesRoutesToChatWhenChatOnly(t *testing.T) {
 	}
 	if _, ok := upstreamBody["input"]; ok {
 		t.Fatalf("expected converted chat body not to include responses input, got %#v", upstreamBody)
+	}
+}
+
+func TestLazyRouteDetectionResolvesResponsesBeforeFallback(t *testing.T) {
+	var upstreamPath string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamPath = r.URL.Path
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":     "resp-upstream",
+			"object": "response",
+			"model":  "responses-model",
+			"output": []any{},
+		})
+	}))
+	defer upstream.Close()
+
+	server := newRouteAwareTestServer(upstream.URL+"/v1", "upstream-secret")
+	resolver := &recordingResolver{
+		route: RouteEntry{
+			ModelID:    "responses-model",
+			Protocol:   RouteProtocolResponses,
+			Endpoint:   "/v1/responses",
+			Confidence: RouteConfidenceModelsMetadata,
+		},
+		ok: true,
+	}
+	server.routeResolver = resolver
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"responses-model","input":"hello"}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if upstreamPath != "/v1/responses" {
+		t.Fatalf("expected native responses passthrough after lazy resolution, got %q", upstreamPath)
+	}
+	if len(resolver.calls) != 1 || resolver.calls[0].entrypoint != RouteProtocolResponses {
+		t.Fatalf("expected one responses resolver call, got %#v", resolver.calls)
+	}
+}
+
+func TestLazyRouteDetectionResolvesMessagesBeforeFallback(t *testing.T) {
+	var upstreamPath string
+	var upstreamBody map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamPath = r.URL.Path
+		if err := json.NewDecoder(r.Body).Decode(&upstreamBody); err != nil {
+			t.Fatalf("Decode upstream body returned error: %v", err)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":   "msg-123",
+			"role": "assistant",
+			"content": []any{
+				map[string]any{"type": "text", "text": "Hi"},
+			},
+			"stop_reason": "end_turn",
+		})
+	}))
+	defer upstream.Close()
+
+	server := newRouteAwareTestServer(upstream.URL+"/v1", "upstream-secret")
+	resolver := &recordingResolver{
+		route: RouteEntry{
+			ModelID:    "messages-model",
+			Protocol:   RouteProtocolMessages,
+			Endpoint:   "/v1/messages",
+			Confidence: RouteConfidenceModelsMetadata,
+			Features:   []string{"thinking"},
+		},
+		ok: true,
+	}
+	server.routeResolver = resolver
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"messages-model","instructions":"Brief.","input":"hello","reasoning":{"effort":"high"}}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if upstreamPath != "/v1/messages" {
+		t.Fatalf("expected messages route after lazy resolution, got %q", upstreamPath)
+	}
+	if upstreamBody["system"] != "Brief." {
+		t.Fatalf("expected responses request to convert to messages body, got %#v", upstreamBody)
+	}
+	if _, ok := upstreamBody["messages"]; !ok {
+		t.Fatalf("expected messages request body, got %#v", upstreamBody)
+	}
+	if len(resolver.calls) != 1 || resolver.calls[0].entrypoint != RouteProtocolResponses {
+		t.Fatalf("expected one responses resolver call, got %#v", resolver.calls)
+	}
+}
+
+func TestLazyRouteDetectionDoesNotCrossConvertControlledEntrypoints(t *testing.T) {
+	server := newRouteAwareTestServer("https://upstream.example/v1", "upstream-secret")
+	resolver := &recordingResolver{
+		route: RouteEntry{
+			ModelID:    "chat-model",
+			Protocol:   RouteProtocolMessages,
+			Endpoint:   "/v1/messages",
+			Confidence: RouteConfidenceModelsMetadata,
+		},
+		ok: true,
+	}
+	server.routeResolver = resolver
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"chat-model","messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	assertErrorTypeAndCode(t, recorder.Body.Bytes(), "invalid_request_error", "unsupported_protocol")
+	if len(resolver.calls) != 1 || resolver.calls[0].entrypoint != RouteProtocolChat {
+		t.Fatalf("expected controlled chat entrypoint to resolve chat only, got %#v", resolver.calls)
+	}
+}
+
+func TestLazyRouteDetectionPreservesAuthAndRateLimitErrors(t *testing.T) {
+	for name, status := range map[string]int{
+		"auth":       http.StatusUnauthorized,
+		"rate_limit": http.StatusTooManyRequests,
+	} {
+		t.Run(name, func(t *testing.T) {
+			server := newRouteAwareTestServer("https://upstream.example/v1", "upstream-secret")
+			server.routeResolver = &recordingResolver{
+				err: &modelDiscoveryError{
+					statusCode: status,
+					message:    sanitizedModelsDiscoveryError(status).Error(),
+				},
+			}
+
+			request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"unknown-model","input":"hello"}`))
+			request.Header.Set("Content-Type", "application/json")
+			recorder := httptest.NewRecorder()
+
+			server.ServeHTTP(recorder, request)
+
+			if recorder.Code != status {
+				t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+			}
+			assertContains(t, recorder.Body.String(), "models discovery failed")
+		})
+	}
+}
+
+func TestDefaultLazyRouteResolverDiscoversMessagesRouteFromModels(t *testing.T) {
+	var requests []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests = append(requests, r.URL.Path)
+		switch r.URL.Path {
+		case "/v1/models":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": []any{
+					map[string]any{
+						"id":                  "claude-4",
+						"supported_endpoints": []any{"messages"},
+						"features":            []any{"thinking"},
+					},
+				},
+			})
+		case "/v1/messages":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id":   "msg-123",
+				"role": "assistant",
+				"content": []any{
+					map[string]any{"type": "text", "text": "Hi"},
+				},
+				"stop_reason": "end_turn",
+			})
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer upstream.Close()
+
+	server := newRouteAwareTestServer(upstream.URL+"/v1", "upstream-secret")
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"claude-4","input":"hello"}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if got := strings.Join(requests, " -> "); got != "/v1/models -> /v1/messages" {
+		t.Fatalf("unexpected request order: %s", got)
+	}
+}
+
+func TestDefaultLazyRouteResolverSurfacesModelsRateLimit(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusTooManyRequests)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error": map[string]any{"message": "slow down"},
+		})
+	}))
+	defer upstream.Close()
+
+	server := newRouteAwareTestServer(upstream.URL+"/v1", "upstream-secret")
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"claude-4","input":"hello"}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	assertContains(t, recorder.Body.String(), "models discovery failed")
+}
+
+func TestNonStreamingResponsesToChatUsesThinkingRectifier(t *testing.T) {
+	callCount := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("Decode upstream body returned error: %v", err)
+		}
+		messages, _ := body["messages"].([]any)
+		lastMessage, _ := messages[len(messages)-1].(map[string]any)
+		content, _ := lastMessage["content"].([]any)
+
+		if callCount == 1 {
+			if len(content) < 2 {
+				t.Fatalf("expected initial request to include thinking and visible text, got %#v", lastMessage)
+			}
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error": map[string]any{
+					"message": "Expected thinking or redacted_thinking, but found tool_use",
+					"type":    "invalid_request_error",
+					"code":    "invalid_format",
+				},
+			})
+			return
+		}
+
+		if len(content) != 1 {
+			t.Fatalf("expected rectified retry to strip thinking blocks, got %#v", lastMessage)
+		}
+		if content[0].(map[string]any)["type"] != "text" {
+			t.Fatalf("expected rectified retry to preserve visible text block, got %#v", content[0])
+		}
+
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":      "chatcmpl-rectified",
+			"created": 123,
+			"model":   "chat-model",
+			"choices": []any{
+				map[string]any{
+					"finish_reason": "stop",
+					"message":       map[string]any{"role": "assistant", "content": "Hi"},
+				},
+			},
+		})
+	}))
+	defer upstream.Close()
+
+	server := newRouteAwareTestServer(upstream.URL+"/v1", "upstream-secret")
+	storeTestRoute(server, "chat-model", RouteProtocolChat, "/v1/chat/completions")
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+		"model":"chat-model",
+		"input":[
+			{"role":"assistant","content":[
+				{"type":"thinking","thinking":"Hidden plan","signature":"sig_1"},
+				{"type":"text","text":"Visible answer","signature":"sig_2"}
+			]}
+		]
+	}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if callCount != 2 {
+		t.Fatalf("expected one retry after rectification, got %d upstream calls", callCount)
+	}
+	assertContains(t, recorder.Body.String(), `"id":"resp-rectified"`)
+}
+
+func TestThinkingRectifierRetriesExactlyOnce(t *testing.T) {
+	callCount := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error": map[string]any{
+				"message": "Expected thinking or redacted_thinking, but found tool_use",
+				"type":    "invalid_request_error",
+				"code":    "invalid_format",
+			},
+		})
+	}))
+	defer upstream.Close()
+
+	server := newRouteAwareTestServer(upstream.URL+"/v1", "upstream-secret")
+	storeTestRoute(server, "chat-model", RouteProtocolChat, "/v1/chat/completions")
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+		"model":"chat-model",
+		"input":[{"role":"assistant","content":[{"type":"thinking","thinking":"Hidden"},{"type":"text","text":"Visible"}]}]
+	}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if callCount != 2 {
+		t.Fatalf("expected exactly two attempts, got %d", callCount)
+	}
+}
+
+func TestThinkingRectifierKeepsToolHistoryAfterStrip(t *testing.T) {
+	callCount := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("Decode upstream body returned error: %v", err)
+		}
+
+		messages, _ := body["messages"].([]any)
+		if len(messages) < 3 {
+			t.Fatalf("expected tool history messages to survive rectification, got %#v", messages)
+		}
+
+		if callCount == 1 {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error": map[string]any{
+					"message": "Expected thinking or redacted_thinking, but found tool_use",
+					"type":    "invalid_request_error",
+					"code":    "invalid_format",
+				},
+			})
+			return
+		}
+
+		var assistantCall map[string]any
+		var toolResult map[string]any
+		for _, raw := range messages {
+			message, _ := raw.(map[string]any)
+			if toolCalls, _ := message["tool_calls"].([]any); len(toolCalls) > 0 {
+				assistantCall = message
+			}
+			if message["role"] == "tool" {
+				toolResult = message
+			}
+		}
+		if assistantCall == nil {
+			t.Fatalf("expected assistant tool call history to survive rectification, got %#v", messages)
+		}
+		if toolResult == nil || toolResult["role"] != "tool" {
+			t.Fatalf("expected tool result history to survive rectification, got %#v", messages)
+		}
+
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":      "chatcmpl-tools",
+			"created": 123,
+			"model":   "chat-model",
+			"choices": []any{
+				map[string]any{
+					"finish_reason": "stop",
+					"message":       map[string]any{"role": "assistant", "content": "Done"},
+				},
+			},
+		})
+	}))
+	defer upstream.Close()
+
+	server := newRouteAwareTestServer(upstream.URL+"/v1", "upstream-secret")
+	storeTestRoute(server, "chat-model", RouteProtocolChat, "/v1/chat/completions")
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+		"model":"chat-model",
+		"input":[
+			{"role":"user","content":"List files"},
+			{"role":"assistant","content":[{"type":"thinking","thinking":"Hidden"}]},
+			{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{\"command\":\"ls\"}"},
+			{"type":"function_call_output","call_id":"call_1","output":"README.md"}
+		]
+	}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if callCount != 2 {
+		t.Fatalf("expected one retry, got %d", callCount)
+	}
+}
+
+func TestThinkingRectifierReturnsOriginalErrorWhenNotApplicable(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error": map[string]any{
+				"message": "Regular invalid request",
+				"type":    "invalid_request_error",
+				"code":    "invalid_request",
+			},
+		})
+	}))
+	defer upstream.Close()
+
+	server := newRouteAwareTestServer(upstream.URL+"/v1", "upstream-secret")
+	storeTestRoute(server, "chat-model", RouteProtocolChat, "/v1/chat/completions")
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"chat-model","input":"hello"}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	assertContains(t, recorder.Body.String(), `"message":"Regular invalid request"`)
+}
+
+func TestForwardResponsesAsChatInjectsConfiguredCacheTTL(t *testing.T) {
+	var upstreamBody map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&upstreamBody); err != nil {
+			t.Fatalf("Decode upstream body returned error: %v", err)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":      "chatcmpl-route",
+			"created": 123,
+			"model":   "chat-model",
+			"choices": []any{
+				map[string]any{
+					"finish_reason": "stop",
+					"message":       map[string]any{"role": "assistant", "content": "Hi"},
+				},
+			},
+		})
+	}))
+	defer upstream.Close()
+
+	server := NewServer(Config{
+		UpstreamBaseURL:    upstream.URL + "/v1",
+		UpstreamAPIKey:     "upstream-secret",
+		RequestTimeout:     secondsToDuration(5),
+		StreamTimeout:      secondsToDuration(5),
+		VerifySSL:          true,
+		CacheOptimizer:     true,
+		CacheOptimizerTTL:  "5m",
+	})
+	storeTestRoute(server, "chat-model", RouteProtocolChat, "/v1/chat/completions")
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+		"model":"chat-model",
+		"instructions":"Be helpful.",
+		"input":[
+			{"role":"assistant","content":[
+				{"type":"thinking","thinking":"Hidden."},
+				{"type":"text","text":"Visible."}
+			]}
+		],
+		"tools":[{"type":"function","name":"shell","function":{"parameters":{"type":"object"}}}]
+	}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	tools, _ := upstreamBody["tools"].([]any)
+	if len(tools) == 0 {
+		t.Fatalf("expected converted tools, got %#v", upstreamBody["tools"])
+	}
+	tool := tools[len(tools)-1].(map[string]any)
+	toolCC, _ := tool["cache_control"].(map[string]any)
+	if toolCC["type"] != "ephemeral" {
+		t.Fatalf("expected cache breakpoint on tool, got %#v", tool["cache_control"])
+	}
+	if _, ok := toolCC["ttl"]; ok {
+		t.Fatalf("expected 5m ttl to omit explicit ttl field, got %#v", toolCC)
+	}
+
+	messages, _ := upstreamBody["messages"].([]any)
+	if len(messages) < 2 {
+		t.Fatalf("expected converted messages, got %#v", upstreamBody["messages"])
+	}
+	assistant := messages[len(messages)-1].(map[string]any)
+	content, _ := assistant["content"].([]any)
+	if len(content) < 2 {
+		t.Fatalf("expected assistant multimodal content, got %#v", assistant)
+	}
+	lastVisible := content[len(content)-1].(map[string]any)
+	cc, _ := lastVisible["cache_control"].(map[string]any)
+	if cc["type"] != "ephemeral" {
+		t.Fatalf("expected cache breakpoint on assistant visible block, got %#v", lastVisible["cache_control"])
+	}
+	if _, ok := cc["ttl"]; ok {
+		t.Fatalf("expected 5m ttl to omit explicit ttl field on assistant block, got %#v", cc)
 	}
 }
 

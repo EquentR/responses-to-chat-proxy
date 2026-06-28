@@ -17,6 +17,8 @@ func TestSaveAndLoadLauncherConfig(t *testing.T) {
 		"upstream_base_url": "https://example.com/v1",
 		"upstream_api_key":  "sk-test",
 		"model_override":    "",
+		"cache_optimizer":   "true",
+		"cache_optimizer_ttl": "5m",
 	}
 
 	if err := saveLauncherConfig(configPath, config); err != nil {
@@ -48,7 +50,7 @@ func TestLoadLauncherConfigIgnoresInvalidJSON(t *testing.T) {
 func TestLoadLauncherConfigAcceptsUTF8BOM(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.json")
 	content := []byte{0xEF, 0xBB, 0xBF}
-	content = append(content, []byte(`{"upstream_base_url":"https://example.com/v1","upstream_api_key":"sk-test","model_override":""}`)...)
+	content = append(content, []byte(`{"upstream_base_url":"https://example.com/v1","upstream_api_key":"sk-test","model_override":"","cache_optimizer":"true","cache_optimizer_ttl":"5m"}`)...)
 	if err := os.WriteFile(configPath, content, 0o600); err != nil {
 		t.Fatalf("WriteFile returned error: %v", err)
 	}
@@ -57,11 +59,13 @@ func TestLoadLauncherConfigAcceptsUTF8BOM(t *testing.T) {
 		"upstream_base_url": "https://example.com/v1",
 		"upstream_api_key":  "sk-test",
 		"model_override":    "",
+		"cache_optimizer":   "true",
+		"cache_optimizer_ttl": "5m",
 	}, loadLauncherConfig(configPath))
 }
 
 func TestPromptForConfigUsesDefaultBaseURLAndStripsTrailingSlash(t *testing.T) {
-	answers := []string{"", " sk-test ", ""}
+	answers := []string{"", " sk-test ", "", "", ""}
 	index := 0
 	prompt := func(string) (string, error) {
 		answer := answers[index]
@@ -75,9 +79,11 @@ func TestPromptForConfigUsesDefaultBaseURLAndStripsTrailingSlash(t *testing.T) {
 	}
 
 	assertJSONEqual(t, map[string]string{
-		"upstream_base_url": "https://example.com/v1",
-		"upstream_api_key":  "sk-test",
-		"model_override":    "",
+		"upstream_base_url":   "https://example.com/v1",
+		"upstream_api_key":    "sk-test",
+		"model_override":      "",
+		"cache_optimizer":     "false",
+		"cache_optimizer_ttl": "1h",
 	}, config)
 }
 
@@ -87,10 +93,14 @@ func TestApplyRuntimeDefaults(t *testing.T) {
 	t.Setenv("PROXY_API_KEY", "")
 	t.Setenv("HOST", "")
 	t.Setenv("PORT", "")
+	t.Setenv("CACHE_OPTIMIZER", "")
+	t.Setenv("CACHE_OPTIMIZER_TTL", "")
 
 	applyRuntimeDefaults(map[string]string{
 		"upstream_base_url": "https://example.com/v1",
 		"upstream_api_key":  "sk-test",
+		"cache_optimizer":   "true",
+		"cache_optimizer_ttl": "5m",
 	}, 8000)
 
 	if os.Getenv("UPSTREAM_BASE_URL") != "https://example.com/v1" {
@@ -101,6 +111,12 @@ func TestApplyRuntimeDefaults(t *testing.T) {
 	}
 	if os.Getenv("PROXY_API_KEY") != "" || os.Getenv("HOST") != "127.0.0.1" || os.Getenv("PORT") != "8000" {
 		t.Fatalf("unexpected runtime defaults")
+	}
+	if os.Getenv("CACHE_OPTIMIZER") != "true" {
+		t.Fatalf("unexpected CACHE_OPTIMIZER: %s", os.Getenv("CACHE_OPTIMIZER"))
+	}
+	if os.Getenv("CACHE_OPTIMIZER_TTL") != "5m" {
+		t.Fatalf("unexpected CACHE_OPTIMIZER_TTL: %s", os.Getenv("CACHE_OPTIMIZER_TTL"))
 	}
 }
 
@@ -115,6 +131,40 @@ func TestApplyRuntimeDefaultsUsesSelectedPort(t *testing.T) {
 	if os.Getenv("PORT") != "8001" {
 		t.Fatalf("unexpected port: %s", os.Getenv("PORT"))
 	}
+}
+
+func TestInteractiveLauncherPersistsCacheOptimizerSettings(t *testing.T) {
+	answers := []string{
+		"https://example.com/v1/",
+		"sk-test",
+		"",
+		"true",
+		"5m",
+	}
+	index := 0
+	prompt := func(string) (string, error) {
+		answer := answers[index]
+		index++
+		return answer, nil
+	}
+
+	config, err := promptForConfig(map[string]string{}, prompt)
+	if err != nil {
+		t.Fatalf("promptForConfig returned error: %v", err)
+	}
+
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	if err := saveLauncherConfig(configPath, config); err != nil {
+		t.Fatalf("saveLauncherConfig returned error: %v", err)
+	}
+
+	assertJSONEqual(t, map[string]string{
+		"upstream_base_url":   "https://example.com/v1",
+		"upstream_api_key":    "sk-test",
+		"model_override":      "",
+		"cache_optimizer":     "true",
+		"cache_optimizer_ttl": "5m",
+	}, loadLauncherConfig(configPath))
 }
 
 func TestFindAvailablePortSkipsBoundPort(t *testing.T) {

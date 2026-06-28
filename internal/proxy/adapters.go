@@ -1750,6 +1750,7 @@ type StreamingConverter struct {
 	reasoningText        string
 	contentThink         thinkTextAccumulator
 	finishReason         string
+	nextSequenceNumber   int
 	toolCalls            map[int]*streamToolCall
 	sseBuffer            string
 	usage                map[string]any
@@ -1950,7 +1951,7 @@ func (c *StreamingConverter) appendReasoningDelta(delta string) []string {
 	c.reasoningText += delta
 	c.sawSubstantiveOutput = true
 	events := c.ensureReasoningItem()
-	events = append(events, sseEvent("response.reasoning_summary_text.delta", map[string]any{
+	events = append(events, c.nextEvent("response.reasoning_summary_text.delta", map[string]any{
 		"item_id": c.reasoningItemID(), "output_index": c.reasoningOutputIndexValue(),
 		"summary_index": 0, "delta": delta,
 	}))
@@ -1964,7 +1965,7 @@ func (c *StreamingConverter) appendVisibleDelta(delta string) []string {
 	c.fullText += delta
 	c.sawSubstantiveOutput = true
 	events := c.ensureContentPart()
-	events = append(events, sseEvent("response.output_text.delta", map[string]any{
+	events = append(events, c.nextEvent("response.output_text.delta", map[string]any{
 		"item_id": c.messageID, "output_index": c.messageOutputIndexValue(),
 		"content_index": 0, "delta": delta,
 	}))
@@ -1990,7 +1991,7 @@ func (c *StreamingConverter) ensureReasoningItem() []string {
 	c.reasoningDone = true
 	outputIndex := c.reasoningOutputIndexValue()
 	return []string{
-		sseEvent("response.output_item.added", map[string]any{
+		c.nextEvent("response.output_item.added", map[string]any{
 			"output_index": outputIndex,
 			"item": map[string]any{
 				"type":    "reasoning",
@@ -1999,7 +2000,7 @@ func (c *StreamingConverter) ensureReasoningItem() []string {
 				"summary": []any{},
 			},
 		}),
-		sseEvent("response.reasoning_summary_part.added", map[string]any{
+		c.nextEvent("response.reasoning_summary_part.added", map[string]any{
 			"item_id": c.reasoningItemID(), "output_index": outputIndex,
 			"summary_index": 0,
 			"part":          map[string]any{"type": "summary_text", "text": ""},
@@ -2012,7 +2013,7 @@ func (c *StreamingConverter) ensureReasoningDelta() []string {
 		return nil
 	}
 	events := c.ensureReasoningItem()
-	events = append(events, sseEvent("response.reasoning_summary_text.delta", map[string]any{
+	events = append(events, c.nextEvent("response.reasoning_summary_text.delta", map[string]any{
 		"item_id": c.reasoningItemID(), "output_index": c.reasoningOutputIndexValue(),
 		"summary_index": 0, "delta": c.reasoningText,
 	}))
@@ -2035,10 +2036,10 @@ func (c *StreamingConverter) ensureInitialized(data map[string]any) []string {
 	c.created = intValue(data["created"])
 
 	return []string{
-		sseEvent("response.created", map[string]any{
+		c.nextEvent("response.created", map[string]any{
 			"response": buildResponseStub(c.responseID, c.created, "in_progress", c.model),
 		}),
-		sseEvent("response.in_progress", map[string]any{
+		c.nextEvent("response.in_progress", map[string]any{
 			"response": map[string]any{
 				"id": c.responseID, "object": "response", "status": "in_progress",
 			},
@@ -2056,7 +2057,7 @@ func (c *StreamingConverter) ensureMessageItem(role ...string) []string {
 	if len(role) > 0 && role[0] != "" {
 		itemRole = role[0]
 	}
-	return []string{sseEvent("response.output_item.added", map[string]any{
+	return []string{c.nextEvent("response.output_item.added", map[string]any{
 		"output_index": outputIndex,
 		"item": map[string]any{
 			"type": "message", "id": c.messageID, "status": "in_progress",
@@ -2071,7 +2072,7 @@ func (c *StreamingConverter) ensureContentPart() []string {
 	}
 	c.contentPartAdded = true
 	events := c.ensureMessageItem()
-	events = append(events, sseEvent("response.content_part.added", map[string]any{
+	events = append(events, c.nextEvent("response.content_part.added", map[string]any{
 		"item_id": c.messageID, "output_index": c.messageOutputIndexValue(),
 		"content_index": 0,
 		"part": map[string]any{
@@ -2107,7 +2108,7 @@ func (c *StreamingConverter) processToolCallDelta(toolCall map[string]any) []str
 	var events []string
 	if !entry.Added && entry.spec.kind != streamToolCallKindUnknown {
 		entry.Added = true
-		events = append(events, sseEvent("response.output_item.added", map[string]any{
+		events = append(events, c.nextEvent("response.output_item.added", map[string]any{
 			"output_index": *entry.OutputIndex,
 			"item":         renderStreamToolCallItem(entry.spec, entry.ItemID, entry.ID, "", "in_progress"),
 		}))
@@ -2121,12 +2122,12 @@ func (c *StreamingConverter) processToolCallDelta(toolCall map[string]any) []str
 			}
 			if !entry.Added {
 				entry.Added = true
-				events = append(events, sseEvent("response.output_item.added", map[string]any{
+				events = append(events, c.nextEvent("response.output_item.added", map[string]any{
 					"output_index": *entry.OutputIndex,
 					"item":         renderStreamToolCallItem(entry.spec, entry.ItemID, entry.ID, "", "in_progress"),
 				}))
 			}
-			events = append(events, sseEvent("response.function_call_arguments.delta", map[string]any{
+			events = append(events, c.nextEvent("response.function_call_arguments.delta", map[string]any{
 				"item_id": entry.ItemID, "output_index": *entry.OutputIndex,
 				"delta": arguments,
 			}))
@@ -2156,7 +2157,7 @@ func (c *StreamingConverter) finishResponse(status string) []string {
 		return nil
 	}
 	c.completed = true
-	return []string{sseEvent("response.completed", map[string]any{
+	return []string{c.nextEvent("response.completed", map[string]any{
 		"response": map[string]any{
 			"id":     valueOrDefault(c.responseID, "resp_unknown"),
 			"object": "response", "created_at": c.created, "status": status,
@@ -2196,11 +2197,17 @@ func (c *StreamingConverter) orderedFinalOutputItems() []finalStreamingOutputIte
 				},
 			},
 			doneEvents: []string{
-				sseEvent("response.reasoning_summary_text.done", map[string]any{
+				c.nextEvent("response.reasoning_summary_text.done", map[string]any{
 					"item_id": c.reasoningItemID(), "output_index": outputIndex, "summary_index": 0,
 					"text": c.reasoningText,
 				}),
-				sseEvent("response.output_item.done", map[string]any{
+				c.nextEvent("response.reasoning_summary_part.done", map[string]any{
+					"item_id": c.reasoningItemID(), "output_index": outputIndex, "summary_index": 0,
+					"part": map[string]any{
+						"type": "summary_text", "text": c.reasoningText,
+					},
+				}),
+				c.nextEvent("response.output_item.done", map[string]any{
 					"output_index": outputIndex,
 					"item": map[string]any{
 						"type": "reasoning", "id": c.reasoningItemID(), "status": "completed",
@@ -2223,18 +2230,18 @@ func (c *StreamingConverter) orderedFinalOutputItems() []finalStreamingOutputIte
 				"content": []any{map[string]any{"type": "output_text", "text": c.fullText, "annotations": []any{}}},
 			},
 			doneEvents: []string{
-				sseEvent("response.output_text.done", map[string]any{
+				c.nextEvent("response.output_text.done", map[string]any{
 					"item_id": c.messageID, "output_index": outputIndex,
 					"content_index": 0, "text": c.fullText,
 				}),
-				sseEvent("response.content_part.done", map[string]any{
+				c.nextEvent("response.content_part.done", map[string]any{
 					"item_id": c.messageID, "output_index": outputIndex,
 					"content_index": 0,
 					"part": map[string]any{
 						"type": "output_text", "text": c.fullText, "annotations": []any{},
 					},
 				}),
-				sseEvent("response.output_item.done", map[string]any{
+				c.nextEvent("response.output_item.done", map[string]any{
 					"output_index": outputIndex,
 					"item": map[string]any{
 						"type": "message", "id": c.messageID, "status": "completed",
@@ -2262,7 +2269,7 @@ func (c *StreamingConverter) orderedFinalOutputItems() []finalStreamingOutputIte
 		addedEvent := ""
 		if !tc.Added {
 			tc.Added = true
-			addedEvent = sseEvent("response.output_item.added", map[string]any{
+			addedEvent = c.nextEvent("response.output_item.added", map[string]any{
 				"output_index": outputIndex,
 				"item":         renderStreamToolCallItem(tc.spec, tc.ItemID, tc.ID, tc.Arguments, "in_progress"),
 			})
@@ -2272,11 +2279,11 @@ func (c *StreamingConverter) orderedFinalOutputItems() []finalStreamingOutputIte
 			addedEvent:  addedEvent,
 			output:      item,
 			doneEvents: []string{
-				sseEvent("response.function_call_arguments.done", map[string]any{
+				c.nextEvent("response.function_call_arguments.done", map[string]any{
 					"item_id": tc.ItemID, "output_index": outputIndex,
 					"arguments": tc.Arguments,
 				}),
-				sseEvent("response.output_item.done", map[string]any{
+				c.nextEvent("response.output_item.done", map[string]any{
 					"output_index": outputIndex,
 					"item":         item,
 				}),
@@ -2463,6 +2470,15 @@ func sseEvent(eventType string, data map[string]any) string {
 	}
 	body, _ := json.Marshal(payload)
 	return fmt.Sprintf("event: %s\ndata: %s\n\n", eventType, body)
+}
+
+func (c *StreamingConverter) nextEvent(eventType string, data map[string]any) string {
+	if data == nil {
+		data = map[string]any{}
+	}
+	data["sequence_number"] = c.nextSequenceNumber
+	c.nextSequenceNumber++
+	return sseEvent(eventType, data)
 }
 
 func sortedToolIndexes(toolCalls map[int]*streamToolCall) []int {

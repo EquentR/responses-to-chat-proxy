@@ -17,8 +17,28 @@ import (
 type Server struct {
 	config       Config
 	routeTable   *RouteTable
+	routeResolver RouteResolver
 	normalClient *http.Client
 	streamClient *http.Client
+}
+
+type RouteResolver interface {
+	ResolveRoute(ctx context.Context, incoming http.Header, model string, entrypoint RouteProtocol) (RouteEntry, bool, error)
+}
+
+type lazyRouteResolver struct {
+	server *Server
+}
+
+type routeProbeUnsupportedError struct {
+	message string
+}
+
+func (e *routeProbeUnsupportedError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return e.message
 }
 
 func NewServer(cfg Config) *Server {
@@ -28,6 +48,7 @@ func NewServer(cfg Config) *Server {
 	return &Server{
 		config:     cfg,
 		routeTable: NewRouteTable(cfg.RouteTableTTL),
+		routeResolver: &lazyRouteResolver{},
 		normalClient: &http.Client{
 			Timeout:   cfg.RequestTimeout,
 			Transport: transport,
@@ -97,7 +118,12 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if route, ok := s.resolveRoute(model); ok {
+	route, ok, err := s.resolveRoute(r.Context(), r.Header, model, RouteProtocolResponses)
+	if err != nil {
+		writeDiscoveryError(w, err)
+		return
+	}
+	if ok {
 		switch route.Protocol {
 		case RouteProtocolResponses:
 			endpointURL := s.routeEndpointURL(route, RouteProtocolResponses)
@@ -129,7 +155,7 @@ func (s *Server) forwardResponsesAsChat(w http.ResponseWriter, r *http.Request, 
 
 	// Apply cache-optimizer: inject cache_control breakpoints for prompt caching.
 	if s.config.CacheOptimizer {
-		InjectCacheBreakpoints(chatRequest, "1h")
+		InjectCacheBreakpoints(chatRequest, s.config.CacheOptimizerTTL)
 	}
 
 	if boolValue(chatRequest["stream"]) {
@@ -137,7 +163,7 @@ func (s *Server) forwardResponsesAsChat(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
-	s.forwardConvertedResponse(w, r, body, chatRequest, s.routeEndpointURL(route, RouteProtocolChat))
+	s.forwardConvertedWithRectifier(w, r, body, chatRequest)
 }
 
 func (s *Server) forwardResponsesAsMessages(w http.ResponseWriter, r *http.Request, body map[string]any, route RouteEntry) {
@@ -167,7 +193,11 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	route, ok := s.resolveRoute(model)
+	route, ok, err := s.resolveRoute(r.Context(), r.Header, model, RouteProtocolChat)
+	if err != nil {
+		writeDiscoveryError(w, err)
+		return
+	}
 	if !ok || route.Protocol != RouteProtocolChat {
 		s.writeUnsupportedProtocol(w, fmt.Sprintf("Model %q does not support chat completions on this route.", model))
 		return
@@ -198,7 +228,11 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	route, ok := s.resolveRoute(model)
+	route, ok, err := s.resolveRoute(r.Context(), r.Header, model, RouteProtocolMessages)
+	if err != nil {
+		writeDiscoveryError(w, err)
+		return
+	}
 	if !ok || route.Protocol != RouteProtocolMessages {
 		s.writeUnsupportedProtocol(w, fmt.Sprintf("Model %q does not support messages on this route.", model))
 		return
@@ -576,6 +610,12 @@ func (s *Server) passthroughStream(w http.ResponseWriter, r *http.Request, body 
 	w.WriteHeader(http.StatusOK)
 
 	flusher, _ := w.(http.Flusher)
+	if resp.StatusCode >= http.StatusBadRequest {
+		errorData := readStreamError(resp)
+		writeSSEChunks(w, flusher, sseError(extractErrorMessage(errorData), fmt.Sprintf("http_%d", resp.StatusCode)))
+		writeSSEChunks(w, flusher, []byte("data: [DONE]\n\n"))
+		return
+	}
 	if protocol != RouteProtocolChat {
 		s.passthroughRawStream(w, flusher, resp)
 		return
@@ -605,12 +645,6 @@ func (s *Server) passthroughStream(w http.ResponseWriter, r *http.Request, body 
 }
 
 func (s *Server) passthroughRawStream(w http.ResponseWriter, flusher http.Flusher, resp *http.Response) {
-	if resp.StatusCode >= http.StatusBadRequest {
-		errorData := readStreamError(resp)
-		writeSSEChunks(w, flusher, sseError(extractErrorMessage(errorData), fmt.Sprintf("http_%d", resp.StatusCode)))
-		return
-	}
-
 	buffer := make([]byte, 4096)
 	for {
 		n, readErr := resp.Body.Read(buffer)
@@ -636,9 +670,173 @@ func (s *Server) requestModel(body map[string]any) string {
 	return stringValue(body["model"])
 }
 
-func (s *Server) resolveRoute(model string) (RouteEntry, bool) {
+func (s *Server) resolveRoute(ctx context.Context, incoming http.Header, model string, entrypoint RouteProtocol) (RouteEntry, bool, error) {
+	if s.routeResolver != nil {
+		if lazyResolver, ok := s.routeResolver.(*lazyRouteResolver); ok && lazyResolver.server == nil {
+			lazyResolver.server = s
+		}
+		return s.routeResolver.ResolveRoute(ctx, incoming, model, entrypoint)
+	}
 	identity := RouteIdentityKey(s.config.UpstreamBaseURL, s.config.UpstreamAPIKey)
-	return s.routeTable.Resolve(identity, model)
+	if route, ok := s.routeTable.Resolve(identity, model); ok {
+		return route, true, nil
+	}
+	return RouteEntry{}, false, nil
+}
+
+func (r *lazyRouteResolver) ResolveRoute(ctx context.Context, incoming http.Header, model string, entrypoint RouteProtocol) (RouteEntry, bool, error) {
+	if r == nil || r.server == nil {
+		return RouteEntry{}, false, nil
+	}
+	return r.server.resolveRouteLazily(ctx, incoming, model, entrypoint)
+}
+
+func (s *Server) resolveRouteLazily(ctx context.Context, incoming http.Header, model string, entrypoint RouteProtocol) (RouteEntry, bool, error) {
+	identity := RouteIdentityKey(s.config.UpstreamBaseURL, s.config.UpstreamAPIKey)
+	if route, ok := s.routeTable.Resolve(identity, model); ok {
+		return route, true, nil
+	}
+	if s.config.RouteDetection == RouteDetectionOff {
+		return RouteEntry{}, false, nil
+	}
+	if s.config.RouteDetection == RouteDetectionStartup {
+		return RouteEntry{}, false, nil
+	}
+
+	selection, err := discoverModelSelection(ctx, s.normalClient, s.config, incoming)
+	if err == nil {
+		ApplyDiscoveredModels(s.routeTable, identity, selection.Results)
+		if route, ok := s.routeTable.Resolve(identity, model); ok {
+			return route, true, nil
+		}
+		return RouteEntry{}, false, nil
+	}
+
+	var noEvidenceErr *modelDiscoveryNoEvidenceError
+	if errors.As(err, &noEvidenceErr) {
+		if !s.config.RouteProbeGeneration {
+			return RouteEntry{}, false, nil
+		}
+		return s.probeRoute(ctx, incoming, model, entrypoint)
+	}
+
+	return RouteEntry{}, false, err
+}
+
+func (s *Server) probeRoute(ctx context.Context, incoming http.Header, model string, entrypoint RouteProtocol) (RouteEntry, bool, error) {
+	for _, protocol := range s.probeProtocolOrder(model, entrypoint) {
+		if err := s.probeProtocol(ctx, incoming, model, protocol); err != nil {
+			var unsupported *routeProbeUnsupportedError
+			if errors.As(err, &unsupported) {
+				continue
+			}
+			return RouteEntry{}, false, err
+		}
+		return RouteEntry{
+			ModelID:    model,
+			Protocol:   protocol,
+			Endpoint:   defaultEndpointForProtocol(protocol),
+			Confidence: RouteConfidenceProbeSuccess,
+			Reasoning:  "detected from lazy probe",
+		}, true, nil
+	}
+	return RouteEntry{}, false, nil
+}
+
+func (s *Server) probeProtocolOrder(model string, entrypoint RouteProtocol) []RouteProtocol {
+	if entrypoint != RouteProtocolResponses {
+		return []RouteProtocol{entrypoint}
+	}
+
+	inferredProtocol, _, _ := inferProtocolFromModelID(model)
+	candidates := []RouteProtocol{RouteProtocolResponses, inferredProtocol, RouteProtocolChat, RouteProtocolMessages}
+	seen := map[RouteProtocol]struct{}{}
+	order := make([]RouteProtocol, 0, len(candidates))
+	for _, protocol := range candidates {
+		if protocol == RouteProtocolUnknown {
+			continue
+		}
+		if _, ok := seen[protocol]; ok {
+			continue
+		}
+		seen[protocol] = struct{}{}
+		order = append(order, protocol)
+	}
+	return order
+}
+
+func (s *Server) probeProtocol(ctx context.Context, incoming http.Header, model string, protocol RouteProtocol) error {
+	body, err := json.Marshal(s.routeProbeBody(model, protocol))
+	if err != nil {
+		return err
+	}
+
+	response, err := s.doRequest(
+		ctx,
+		s.normalClient,
+		http.MethodPost,
+		joinUpstreamEndpoint(s.config.UpstreamBaseURL, defaultEndpointForProtocol(protocol)),
+		copyHeaders(incoming, s.config.UpstreamAPIKey),
+		bytes.NewReader(body),
+	)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+
+	switch response.StatusCode {
+	case http.StatusUnauthorized, http.StatusForbidden, http.StatusTooManyRequests:
+		return &modelDiscoveryError{
+			statusCode: response.StatusCode,
+			message:    sanitizedModelsDiscoveryError(response.StatusCode).Error(),
+		}
+	case http.StatusNotFound, http.StatusMethodNotAllowed, http.StatusNotImplemented:
+		return &routeProbeUnsupportedError{message: fmt.Sprintf("route probe candidate returned HTTP %d", response.StatusCode)}
+	}
+
+	if response.StatusCode >= http.StatusInternalServerError {
+		return &modelDiscoveryError{
+			statusCode: response.StatusCode,
+			message:    sanitizedModelsDiscoveryError(response.StatusCode).Error(),
+		}
+	}
+	if response.StatusCode >= http.StatusBadRequest {
+		return &routeProbeUnsupportedError{message: fmt.Sprintf("route probe candidate returned HTTP %d", response.StatusCode)}
+	}
+
+	return nil
+}
+
+func (s *Server) routeProbeBody(model string, protocol RouteProtocol) map[string]any {
+	switch protocol {
+	case RouteProtocolResponses:
+		return map[string]any{
+			"model":             model,
+			"input":             "route probe",
+			"max_output_tokens": 1,
+		}
+	case RouteProtocolMessages:
+		return map[string]any{
+			"model": model,
+			"messages": []any{
+				map[string]any{
+					"role": "user",
+					"content": []any{
+						map[string]any{"type": "text", "text": "route probe"},
+					},
+				},
+			},
+			"max_tokens": 1,
+		}
+	default:
+		return map[string]any{
+			"model": model,
+			"messages": []any{
+				map[string]any{"role": "user", "content": "route probe"},
+			},
+			"max_tokens": 1,
+		}
+	}
 }
 
 func (s *Server) routeEndpointURL(route RouteEntry, fallbackProtocol RouteProtocol) string {
@@ -739,10 +937,14 @@ func (s *Server) writeStreamFailure(w http.ResponseWriter, err error, converter 
 
 func copyHeaders(incoming http.Header, upstreamAPIKey string) http.Header {
 	headers := http.Header{}
-	headers.Set("Content-Type", "application/json")
+	contentType := strings.TrimSpace(incoming.Get("Content-Type"))
+	if contentType == "" {
+		contentType = "application/json"
+	}
+	headers.Set("Content-Type", contentType)
 	for key, values := range incoming {
 		lower := strings.ToLower(key)
-		if lower == "host" || lower == "content-length" || lower == "accept-encoding" || lower == "connection" {
+		if lower == "host" || lower == "content-length" || lower == "accept-encoding" || lower == "connection" || lower == "content-type" {
 			continue
 		}
 		if upstreamAPIKey != "" && (lower == "authorization" || lower == "x-api-key" || lower == "x-goog-api-key") {

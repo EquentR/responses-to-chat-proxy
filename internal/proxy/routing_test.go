@@ -175,6 +175,8 @@ func TestLoadConfigRouteSettings(t *testing.T) {
 			"ROUTE_TABLE_TTL_SECONDS",
 			"ROUTE_TABLE_PERSIST",
 			"ROUTE_PROBE_GENERATION",
+			"CACHE_OPTIMIZER",
+			"CACHE_OPTIMIZER_TTL",
 		)
 
 		cfg, err := LoadConfigFromEnv("")
@@ -203,6 +205,12 @@ func TestLoadConfigRouteSettings(t *testing.T) {
 		if cfg.RouteProbeGeneration {
 			t.Fatal("expected route probe generation to default to false")
 		}
+		if cfg.CacheOptimizer {
+			t.Fatal("expected cache optimizer to default to false")
+		}
+		if cfg.CacheOptimizerTTL != "1h" {
+			t.Fatalf("unexpected default cache optimizer TTL: %q", cfg.CacheOptimizerTTL)
+		}
 	})
 
 	t.Run("parses route settings and preserves existing config behavior", func(t *testing.T) {
@@ -222,6 +230,8 @@ func TestLoadConfigRouteSettings(t *testing.T) {
 		t.Setenv("ROUTE_TABLE_TTL_SECONDS", "90")
 		t.Setenv("ROUTE_TABLE_PERSIST", "true")
 		t.Setenv("ROUTE_PROBE_GENERATION", "true")
+		t.Setenv("CACHE_OPTIMIZER", "true")
+		t.Setenv("CACHE_OPTIMIZER_TTL", "5m")
 
 		cfg, err := LoadConfigFromEnv("")
 		if err != nil {
@@ -271,6 +281,12 @@ func TestLoadConfigRouteSettings(t *testing.T) {
 		if !cfg.RouteProbeGeneration {
 			t.Fatal("expected route probe generation to parse true")
 		}
+		if !cfg.CacheOptimizer {
+			t.Fatal("expected cache optimizer to parse true")
+		}
+		if cfg.CacheOptimizerTTL != "5m" {
+			t.Fatalf("unexpected cache optimizer TTL: %q", cfg.CacheOptimizerTTL)
+		}
 	})
 }
 
@@ -291,6 +307,22 @@ func TestLoadConfigNormalizesNonPositiveRouteTableTTL(t *testing.T) {
 				t.Fatalf("unexpected route TTL duration: got %v, want %v", cfg.RouteTableTTL, 30*time.Minute)
 			}
 		})
+	}
+}
+
+func TestLoadConfigCacheOptimizerSettings(t *testing.T) {
+	t.Setenv("CACHE_OPTIMIZER", "true")
+	t.Setenv("CACHE_OPTIMIZER_TTL", "5m")
+
+	cfg, err := LoadConfigFromEnv("")
+	if err != nil {
+		t.Fatalf("LoadConfigFromEnv returned error: %v", err)
+	}
+	if !cfg.CacheOptimizer {
+		t.Fatal("expected cache optimizer to parse true")
+	}
+	if cfg.CacheOptimizerTTL != "5m" {
+		t.Fatalf("unexpected cache optimizer TTL: %q", cfg.CacheOptimizerTTL)
 	}
 }
 

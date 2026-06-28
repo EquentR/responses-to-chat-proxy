@@ -92,7 +92,7 @@ func loadLauncherConfig(configPath string) map[string]string {
 	}
 
 	config := map[string]string{}
-	for _, key := range []string{"upstream_base_url", "upstream_api_key", "model_override"} {
+	for _, key := range []string{"upstream_base_url", "upstream_api_key", "model_override", "cache_optimizer", "cache_optimizer_ttl"} {
 		if value := stringValue(rawConfig[key]); value != "" || key == "model_override" {
 			config[key] = value
 		}
@@ -146,10 +146,38 @@ func promptForConfig(existingConfig map[string]string, prompt PromptFunc) (map[s
 		modelOverride = defaultModel
 	}
 
+	defaultCacheOptimizer := existingConfig["cache_optimizer"]
+	if defaultCacheOptimizer == "" {
+		defaultCacheOptimizer = "false"
+	}
+	cacheOptimizer, err := prompt(fmt.Sprintf("Enable cache optimizer [true/false] [%s]: ", defaultCacheOptimizer))
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+	cacheOptimizer = strings.TrimSpace(strings.ToLower(cacheOptimizer))
+	if cacheOptimizer == "" {
+		cacheOptimizer = defaultCacheOptimizer
+	}
+
+	defaultCacheOptimizerTTL := existingConfig["cache_optimizer_ttl"]
+	if defaultCacheOptimizerTTL == "" {
+		defaultCacheOptimizerTTL = "1h"
+	}
+	cacheOptimizerTTL, err := prompt(fmt.Sprintf("Cache optimizer TTL [%s]: ", defaultCacheOptimizerTTL))
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+	cacheOptimizerTTL = strings.TrimSpace(cacheOptimizerTTL)
+	if cacheOptimizerTTL == "" {
+		cacheOptimizerTTL = defaultCacheOptimizerTTL
+	}
+
 	return map[string]string{
-		"upstream_base_url": strings.TrimRight(upstreamBaseURL, "/"),
-		"upstream_api_key":  strings.TrimSpace(upstreamAPIKey),
-		"model_override":    modelOverride,
+		"upstream_base_url":   strings.TrimRight(upstreamBaseURL, "/"),
+		"upstream_api_key":    strings.TrimSpace(upstreamAPIKey),
+		"model_override":      modelOverride,
+		"cache_optimizer":     cacheOptimizer,
+		"cache_optimizer_ttl": cacheOptimizerTTL,
 	}, nil
 }
 
@@ -188,9 +216,11 @@ func saveLauncherConfig(configPath string, config map[string]string) error {
 	}
 
 	content, err := json.MarshalIndent(map[string]string{
-		"upstream_base_url": config["upstream_base_url"],
-		"upstream_api_key":  config["upstream_api_key"],
-		"model_override":    config["model_override"],
+		"upstream_base_url":   config["upstream_base_url"],
+		"upstream_api_key":    config["upstream_api_key"],
+		"model_override":      config["model_override"],
+		"cache_optimizer":     config["cache_optimizer"],
+		"cache_optimizer_ttl": config["cache_optimizer_ttl"],
 	}, "", "  ")
 	if err != nil {
 		return err
@@ -204,6 +234,8 @@ func applyRuntimeDefaults(config map[string]string, port int) {
 	_ = os.Setenv("UPSTREAM_API_KEY", config["upstream_api_key"])
 	_ = os.Setenv("PROXY_API_KEY", "")
 	_ = os.Setenv("MODEL_OVERRIDE", config["model_override"])
+	_ = os.Setenv("CACHE_OPTIMIZER", config["cache_optimizer"])
+	_ = os.Setenv("CACHE_OPTIMIZER_TTL", config["cache_optimizer_ttl"])
 	_ = os.Setenv("HOST", defaultHost)
 	_ = os.Setenv("PORT", fmt.Sprintf("%d", port))
 	if _, exists := os.LookupEnv("LOG_LEVEL"); !exists {
