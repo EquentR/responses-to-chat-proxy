@@ -1735,6 +1735,7 @@ type StreamingConverter struct {
 	textDone             bool
 	outputItemDone       bool
 	completed            bool
+	doneSent             bool
 	reasoningDone        bool
 	sawSubstantiveOutput bool
 	nextOutputIndex      int
@@ -1840,6 +1841,7 @@ func (c *StreamingConverter) Feed(chunk []byte) []string {
 func (c *StreamingConverter) Finish() []string {
 	events := c.finishOutputItems()
 	events = append(events, c.finishResponse(c.finalStatus())...)
+	events = append(events, c.doneSentinel()...)
 	return events
 }
 
@@ -1948,9 +1950,9 @@ func (c *StreamingConverter) appendReasoningDelta(delta string) []string {
 	c.reasoningText += delta
 	c.sawSubstantiveOutput = true
 	events := c.ensureReasoningItem()
-	events = append(events, sseEvent("response.reasoning_text.delta", map[string]any{
+	events = append(events, sseEvent("response.reasoning_summary_text.delta", map[string]any{
 		"item_id": c.reasoningItemID(), "output_index": c.reasoningOutputIndexValue(),
-		"content_index": 0, "delta": delta,
+		"summary_index": 0, "delta": delta,
 	}))
 	return events
 }
@@ -1987,15 +1989,22 @@ func (c *StreamingConverter) ensureReasoningItem() []string {
 	}
 	c.reasoningDone = true
 	outputIndex := c.reasoningOutputIndexValue()
-	return []string{sseEvent("response.output_item.added", map[string]any{
-		"output_index": outputIndex,
-		"item": map[string]any{
-			"type":    "reasoning",
-			"id":      c.reasoningItemID(),
-			"status":  "in_progress",
-			"summary": []any{},
-		},
-	})}
+	return []string{
+		sseEvent("response.output_item.added", map[string]any{
+			"output_index": outputIndex,
+			"item": map[string]any{
+				"type":    "reasoning",
+				"id":      c.reasoningItemID(),
+				"status":  "in_progress",
+				"summary": []any{},
+			},
+		}),
+		sseEvent("response.reasoning_summary_part.added", map[string]any{
+			"item_id": c.reasoningItemID(), "output_index": outputIndex,
+			"summary_index": 0,
+			"part":          map[string]any{"type": "summary_text", "text": ""},
+		}),
+	}
 }
 
 func (c *StreamingConverter) ensureReasoningDelta() []string {
@@ -2003,9 +2012,9 @@ func (c *StreamingConverter) ensureReasoningDelta() []string {
 		return nil
 	}
 	events := c.ensureReasoningItem()
-	events = append(events, sseEvent("response.reasoning_text.delta", map[string]any{
+	events = append(events, sseEvent("response.reasoning_summary_text.delta", map[string]any{
 		"item_id": c.reasoningItemID(), "output_index": c.reasoningOutputIndexValue(),
-		"content_index": 0, "delta": c.reasoningText,
+		"summary_index": 0, "delta": c.reasoningText,
 	}))
 	return events
 }
@@ -2156,6 +2165,14 @@ func (c *StreamingConverter) finishResponse(status string) []string {
 	})}
 }
 
+func (c *StreamingConverter) doneSentinel() []string {
+	if c.doneSent {
+		return nil
+	}
+	c.doneSent = true
+	return []string{"data: [DONE]\n\n"}
+}
+
 func (c *StreamingConverter) buildOutput() []any {
 	items := c.orderedFinalOutputItems()
 	output := make([]any, 0, len(items))
@@ -2179,8 +2196,8 @@ func (c *StreamingConverter) orderedFinalOutputItems() []finalStreamingOutputIte
 				},
 			},
 			doneEvents: []string{
-				sseEvent("response.reasoning_text.done", map[string]any{
-					"item_id": c.reasoningItemID(), "output_index": outputIndex, "content_index": 0,
+				sseEvent("response.reasoning_summary_text.done", map[string]any{
+					"item_id": c.reasoningItemID(), "output_index": outputIndex, "summary_index": 0,
 					"text": c.reasoningText,
 				}),
 				sseEvent("response.output_item.done", map[string]any{

@@ -835,7 +835,7 @@ func TestStreamingConverterHandlesReasoningObjectDeltas(t *testing.T) {
 	}
 }
 
-func TestStreamingConverterReasoningUsesResponseSuffixAndOutputIndex(t *testing.T) {
+func TestStreamingConverterReasoningUsesSummaryPartEventsAndOutputIndex(t *testing.T) {
 	converter := NewStreamingConverter()
 	chunk := "data: " + mustJSON(map[string]any{
 		"id":      "chatcmpl-abc",
@@ -853,7 +853,7 @@ func TestStreamingConverterReasoningUsesResponseSuffixAndOutputIndex(t *testing.
 		"model":   "test-model",
 		"choices": []any{
 			map[string]any{
-				"delta":         map[string]any{"content": "<think>Hidden thought.</think>"},
+				"delta":         map[string]any{"reasoning_content": "Hidden thought."},
 				"finish_reason": nil,
 			},
 		},
@@ -867,15 +867,34 @@ func TestStreamingConverterReasoningUsesResponseSuffixAndOutputIndex(t *testing.
 	}) + "\n\n"
 
 	payloads := ssePayloads(converter.Feed([]byte(chunk)))
+	var summaryPartAdded map[string]any
 	var reasoningDelta map[string]any
 	for _, payload := range payloads {
-		if payload["type"] == "response.reasoning_text.delta" {
+		switch payload["type"] {
+		case "response.reasoning_summary_part.added":
+			summaryPartAdded = payload
+		case "response.reasoning_summary_text.delta":
 			reasoningDelta = payload
-			break
 		}
 	}
+	if summaryPartAdded == nil {
+		t.Fatalf("missing reasoning summary part payloads=%#v", payloads)
+	}
 	if reasoningDelta == nil {
-		t.Fatalf("missing reasoning delta payloads=%#v", payloads)
+		t.Fatalf("missing reasoning summary delta payloads=%#v", payloads)
+	}
+	if summaryPartAdded["item_id"] != "rs_abc" {
+		t.Fatalf("expected reasoning item_id rs_abc, got %#v", summaryPartAdded["item_id"])
+	}
+	if summaryPartAdded["output_index"] != float64(1) {
+		t.Fatalf("expected reasoning output_index 1, got %#v", summaryPartAdded["output_index"])
+	}
+	if summaryPartAdded["summary_index"] != float64(0) {
+		t.Fatalf("expected reasoning summary_index 0, got %#v", summaryPartAdded["summary_index"])
+	}
+	part := summaryPartAdded["part"].(map[string]any)
+	if part["type"] != "summary_text" || part["text"] != "" {
+		t.Fatalf("unexpected reasoning summary part: %#v", part)
 	}
 	if reasoningDelta["item_id"] != "rs_abc" {
 		t.Fatalf("expected reasoning item_id rs_abc, got %#v", reasoningDelta["item_id"])
@@ -883,10 +902,48 @@ func TestStreamingConverterReasoningUsesResponseSuffixAndOutputIndex(t *testing.
 	if reasoningDelta["output_index"] != float64(1) {
 		t.Fatalf("expected reasoning output_index 1, got %#v", reasoningDelta["output_index"])
 	}
+	if reasoningDelta["summary_index"] != float64(0) {
+		t.Fatalf("expected reasoning summary_index 0, got %#v", reasoningDelta["summary_index"])
+	}
+	if reasoningDelta["delta"] != "Hidden thought." {
+		t.Fatalf("unexpected reasoning delta: %#v", reasoningDelta["delta"])
+	}
 	for _, payload := range payloads {
 		if payload["type"] == "response.output_text.delta" && payload["delta"] == "" {
 			t.Fatalf("unexpected empty visible delta: %#v", payload)
 		}
+	}
+}
+
+func TestStreamingConverterAppendsDoneSentinelAfterCompletion(t *testing.T) {
+	converter := NewStreamingConverter()
+	chunk := "data: " + mustJSON(map[string]any{
+		"id":      "chatcmpl-abc",
+		"created": 123,
+		"model":   "test-model",
+		"choices": []any{
+			map[string]any{"delta": map[string]any{"role": "assistant", "content": "Hi"}, "finish_reason": nil},
+		},
+	}) + "\n\n" + "data: " + mustJSON(map[string]any{
+		"id":      "chatcmpl-abc",
+		"created": 123,
+		"model":   "test-model",
+		"choices": []any{
+			map[string]any{"delta": map[string]any{}, "finish_reason": "stop"},
+		},
+	}) + "\n\n" + "data: [DONE]\n\n"
+
+	events := converter.Feed([]byte(chunk))
+	if len(events) == 0 {
+		t.Fatal("expected SSE events")
+	}
+	if got := events[len(events)-1]; got != "data: [DONE]\n\n" {
+		t.Fatalf("expected final SSE sentinel, got %q", got)
+	}
+
+	payloads := ssePayloads(events)
+	if completed := findPayload(payloads, "response.completed"); completed == nil {
+		t.Fatalf("missing response.completed payloads=%#v", payloads)
 	}
 }
 

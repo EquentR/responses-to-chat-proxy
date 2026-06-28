@@ -56,6 +56,9 @@ func (n *chatCompletionStreamNormalizer) processEvent(rawEvent string) [][]byte 
 	if trimmed == "" {
 		return nil
 	}
+	if n.sawDone {
+		return nil
+	}
 
 	var dataLines []string
 	for _, line := range strings.Split(rawEvent, "\n") {

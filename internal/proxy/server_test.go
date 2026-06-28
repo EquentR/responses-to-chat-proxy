@@ -1259,3 +1259,48 @@ func TestChatCompletionsStreamInsertsFinishReasonBeforeDone(t *testing.T) {
 		t.Fatalf("expected synthesized finish_reason before [DONE], body=%s", body)
 	}
 }
+
+func TestChatCompletionsStreamIgnoresEventsAfterDone(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: " + mustJSON(map[string]any{
+			"id":      "chatcmpl-abc",
+			"object":  "chat.completion.chunk",
+			"created": 123,
+			"model":   "test-model",
+			"choices": []any{
+				map[string]any{
+					"index":         0,
+					"delta":         map[string]any{"content": "Hi"},
+					"finish_reason": nil,
+				},
+			},
+		}) + "\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		_, _ = w.Write([]byte("data: {\"choices\":[],\"cost\":\"0\"}\n\n"))
+	}))
+	defer upstream.Close()
+
+	server := NewServer(Config{
+		UpstreamBaseURL: upstream.URL + "/v1",
+		RequestTimeout:  secondsToDuration(5),
+		StreamTimeout:   secondsToDuration(5),
+		VerifySSL:       true,
+	})
+	storeTestRoute(server, "test-model", RouteProtocolChat, "/v1/chat/completions")
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test-model","messages":[],"stream":true}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	body := recorder.Body.String()
+	doneIndex := strings.Index(body, "data: [DONE]")
+	if doneIndex < 0 {
+		t.Fatalf("expected [DONE] marker in body=%s", body)
+	}
+	if strings.Contains(body, `"cost":"0"`) {
+		t.Fatalf("expected stream to stop at [DONE], body=%s", body)
+	}
+}
