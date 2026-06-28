@@ -26,7 +26,7 @@ func TestConvertResponsesToMessagesHandlesInstructionsAndTools(t *testing.T) {
 				},
 			},
 		},
-	}, Config{})
+	}, Config{}, RouteEntry{})
 
 	if converted["system"] != "Be helpful." {
 		t.Fatalf("unexpected system: %#v", converted["system"])
@@ -81,7 +81,7 @@ func TestConvertResponsesToMessagesHandlesImagesAndReasoning(t *testing.T) {
 				},
 			},
 		},
-	}, Config{})
+	}, Config{}, RouteEntry{Features: []string{"image", "audio", "file"}})
 
 	messages, _ := converted["messages"].([]any)
 	if len(messages) != 4 {
@@ -108,12 +108,12 @@ func TestConvertResponsesToMessagesOnlyEmitsThinkingWhenExplicitlyConfigured(t *
 		"input": "Hello",
 	}
 
-	defaultConverted := ConvertResponsesToMessages(input, Config{})
+	defaultConverted := ConvertResponsesToMessages(input, Config{}, RouteEntry{})
 	if _, ok := defaultConverted["thinking"]; ok {
 		t.Fatalf("unexpected thinking without explicit mode: %#v", defaultConverted["thinking"])
 	}
 
-	thinkingConverted := ConvertResponsesToMessages(input, Config{ReasoningMode: ReasoningThinking})
+	thinkingConverted := ConvertResponsesToMessages(input, Config{ReasoningMode: ReasoningThinking}, RouteEntry{})
 	thinking, _ := thinkingConverted["thinking"].(map[string]any)
 	if thinking["type"] != "enabled" || thinking["budget_tokens"] != 128 {
 		t.Fatalf("expected explicit thinking mode to emit thinking, got %#v", thinkingConverted["thinking"])
@@ -125,10 +125,85 @@ func TestConvertResponsesToMessagesOnlyEmitsThinkingWhenExplicitlyConfigured(t *
 			"effort": "off",
 		},
 		"input": "Hello",
-	}, Config{ReasoningMode: ReasoningThinkingOnly})
+	}, Config{ReasoningMode: ReasoningThinkingOnly}, RouteEntry{})
 	disabledThinking, _ := disabledConverted["thinking"].(map[string]any)
 	if disabledThinking["type"] != "disabled" {
 		t.Fatalf("expected explicit thinking_only mode to emit disabled thinking, got %#v", disabledConverted["thinking"])
+	}
+}
+
+func TestConvertResponsesToMessagesEmitsThinkingWhenRouteFeaturesAllowIt(t *testing.T) {
+	converted := ConvertResponsesToMessages(map[string]any{
+		"model": "claude-4",
+		"reasoning": map[string]any{
+			"effort":        "medium",
+			"budget_tokens": 64,
+		},
+		"input": "Hello",
+	}, Config{}, RouteEntry{Features: []string{"thinking"}})
+
+	thinking, _ := converted["thinking"].(map[string]any)
+	if thinking["type"] != "enabled" || thinking["budget_tokens"] != 64 {
+		t.Fatalf("expected route features to enable thinking, got %#v", converted["thinking"])
+	}
+}
+
+func TestConvertResponsesToMessagesDoesNotEmitThinkingWithoutConfigOrRouteSupport(t *testing.T) {
+	converted := ConvertResponsesToMessages(map[string]any{
+		"model": "claude-4",
+		"reasoning": map[string]any{
+			"effort": "high",
+		},
+		"input": "Hello",
+	}, Config{}, RouteEntry{Features: []string{"text"}})
+
+	if _, ok := converted["thinking"]; ok {
+		t.Fatalf("unexpected thinking without explicit support: %#v", converted["thinking"])
+	}
+}
+
+func TestConvertResponsesToMessagesDowngradesMultimodalWhenRouteIsTextOnly(t *testing.T) {
+	converted := ConvertResponsesToMessages(map[string]any{
+		"model": "claude-4",
+		"input": []any{
+			map[string]any{
+				"type":      "input_image",
+				"image_url": "https://example.com/image.png",
+			},
+			map[string]any{
+				"type":     "input_file",
+				"file_id":  "file-123",
+				"filename": "notes.txt",
+			},
+			map[string]any{
+				"type": "input_audio",
+				"input_audio": map[string]any{
+					"format": "mp3",
+					"data":   "QUJD",
+				},
+			},
+		},
+	}, Config{}, RouteEntry{Features: []string{"text"}})
+
+	messages, _ := converted["messages"].([]any)
+	if len(messages) != 3 {
+		t.Fatalf("expected three downgraded messages, got %#v", converted["messages"])
+	}
+
+	wantSubstrings := []string{
+		"[image input]",
+		"[file input]",
+		"[audio input]",
+	}
+	for index, want := range wantSubstrings {
+		content, _ := messages[index].(map[string]any)["content"].([]any)
+		if len(content) != 1 || content[0].(map[string]any)["type"] != "text" {
+			t.Fatalf("expected downgraded text block at index %d, got %#v", index, messages[index])
+		}
+		text := content[0].(map[string]any)["text"].(string)
+		if !strings.Contains(text, want) {
+			t.Fatalf("expected downgraded text %q to contain %q", text, want)
+		}
 	}
 }
 
@@ -151,7 +226,7 @@ func TestConvertResponsesToMessagesNormalizesNestedAudioContent(t *testing.T) {
 				},
 			},
 		},
-	}, Config{})
+	}, Config{}, RouteEntry{Features: []string{"audio"}})
 
 	messages, _ := converted["messages"].([]any)
 	if len(messages) != 1 {

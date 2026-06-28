@@ -10,7 +10,7 @@ import (
 // Responses -> Messages
 // -----------------------------------------------------------------------------
 
-func ConvertResponsesToMessages(data map[string]any, cfg Config) map[string]any {
+func ConvertResponsesToMessages(data map[string]any, cfg Config, route RouteEntry) map[string]any {
 	model := stringValue(data["model"])
 	if cfg.ModelOverride != "" {
 		model = cfg.ModelOverride
@@ -23,7 +23,7 @@ func ConvertResponsesToMessages(data map[string]any, cfg Config) map[string]any 
 	if system := stringValue(data["instructions"]); system != "" {
 		result["system"] = system
 	}
-	if thinking := convertResponsesThinking(data["reasoning"], cfg); thinking != nil {
+	if thinking := convertResponsesThinking(data["reasoning"], cfg, route); thinking != nil {
 		result["thinking"] = thinking
 	}
 	if maxOutput := data["max_output_tokens"]; maxOutput != nil {
@@ -34,19 +34,19 @@ func ConvertResponsesToMessages(data map[string]any, cfg Config) map[string]any 
 	if tools := convertResponsesToolsToMessages(data["tools"]); len(tools) > 0 {
 		result["tools"] = tools
 	}
-	result["messages"] = convertResponsesInputToMessages(data["input"])
+	result["messages"] = convertResponsesInputToMessages(data["input"], route)
 	if stream, ok := data["stream"].(bool); ok {
 		result["stream"] = stream
 	}
 	return result
 }
 
-func convertResponsesThinking(raw any, cfg Config) map[string]any {
+func convertResponsesThinking(raw any, cfg Config, route RouteEntry) map[string]any {
 	reasoning, _ := raw.(map[string]any)
 	if len(reasoning) == 0 {
 		return nil
 	}
-	if cfg.ReasoningMode != ReasoningThinking && cfg.ReasoningMode != ReasoningThinkingOnly {
+	if !allowMessagesThinking(cfg, route) {
 		return nil
 	}
 	effort := strings.ToLower(stringValue(reasoning["effort"]))
@@ -63,7 +63,7 @@ func convertResponsesThinking(raw any, cfg Config) map[string]any {
 	return thinking
 }
 
-func convertResponsesInputToMessages(input any) []any {
+func convertResponsesInputToMessages(input any, route RouteEntry) []any {
 	switch typed := input.(type) {
 	case string:
 		return []any{map[string]any{
@@ -75,7 +75,7 @@ func convertResponsesInputToMessages(input any) []any {
 	case []any:
 		var messages []any
 		for _, raw := range typed {
-			msg, ok := convertResponsesInputItemToMessage(raw)
+			msg, ok := convertResponsesInputItemToMessage(raw, route)
 			if ok {
 				messages = append(messages, msg)
 			}
@@ -86,7 +86,7 @@ func convertResponsesInputToMessages(input any) []any {
 	}
 }
 
-func convertResponsesInputItemToMessage(raw any) (map[string]any, bool) {
+func convertResponsesInputItemToMessage(raw any, route RouteEntry) (map[string]any, bool) {
 	item, ok := raw.(map[string]any)
 	if !ok {
 		return nil, false
@@ -105,6 +105,9 @@ func convertResponsesInputItemToMessage(raw any) (map[string]any, bool) {
 			},
 		}, text != ""
 	case "input_image":
+		if shouldDowngradeMessagesInput("image", route) {
+			return downgradedResponsesInputMessage("image", item)
+		}
 		image := buildAnthropicImageSource(item)
 		if len(image) == 0 {
 			return nil, false
@@ -116,6 +119,9 @@ func convertResponsesInputItemToMessage(raw any) (map[string]any, bool) {
 			},
 		}, true
 	case "input_file":
+		if shouldDowngradeMessagesInput("file", route) {
+			return downgradedResponsesInputMessage("file", item)
+		}
 		file := buildAnthropicDocumentSource(item)
 		if len(file) == 0 {
 			return nil, false
@@ -127,6 +133,9 @@ func convertResponsesInputItemToMessage(raw any) (map[string]any, bool) {
 			},
 		}, true
 	case "input_audio":
+		if shouldDowngradeMessagesInput("audio", route) {
+			return downgradedResponsesInputMessage("audio", item)
+		}
 		audio := buildAnthropicAudioSource(item)
 		if len(audio) == 0 {
 			return nil, false
@@ -138,7 +147,7 @@ func convertResponsesInputItemToMessage(raw any) (map[string]any, bool) {
 			},
 		}, true
 	case "message":
-		return normalizeAnthropicMessage(item), true
+		return normalizeAnthropicMessage(item, route), true
 	case "reasoning":
 		text := extractMessagesReasoningText(item)
 		if text == "" {
@@ -160,14 +169,14 @@ func convertResponsesInputItemToMessage(raw any) (map[string]any, bool) {
 		return convertToolSearchCallToAssistantMessage(item), true
 	default:
 		if role := stringValue(item["role"]); role != "" {
-			return normalizeAnthropicMessage(item), true
+			return normalizeAnthropicMessage(item, route), true
 		}
 	}
 
 	return nil, false
 }
 
-func normalizeAnthropicMessage(item map[string]any) map[string]any {
+func normalizeAnthropicMessage(item map[string]any, route RouteEntry) map[string]any {
 	role := stringValue(item["role"])
 	if role == "" {
 		role = "user"
@@ -181,7 +190,7 @@ func normalizeAnthropicMessage(item map[string]any) map[string]any {
 	case string:
 		content = []any{map[string]any{"type": "text", "text": typed}}
 	case []any:
-		content = normalizeMessagesContent(typed)
+		content = normalizeMessagesContent(typed, route)
 	}
 
 	return map[string]any{
@@ -190,7 +199,7 @@ func normalizeAnthropicMessage(item map[string]any) map[string]any {
 	}
 }
 
-func normalizeMessagesContent(parts []any) []any {
+func normalizeMessagesContent(parts []any, route RouteEntry) []any {
 	normalized := make([]any, 0, len(parts))
 	for _, raw := range parts {
 		part, ok := raw.(map[string]any)
@@ -204,6 +213,10 @@ func normalizeMessagesContent(parts []any) []any {
 				"text": stringValue(part["text"]),
 			})
 		case "image", "input_image":
+			if shouldDowngradeMessagesInput("image", route) {
+				normalized = append(normalized, downgradedResponsesInputTextBlock("image", part))
+				continue
+			}
 			source := cloneMap(sourceMap(part["source"]))
 			if len(source) == 0 {
 				source = buildAnthropicImageSource(part)
@@ -215,6 +228,10 @@ func normalizeMessagesContent(parts []any) []any {
 				})
 			}
 		case "document", "input_file":
+			if shouldDowngradeMessagesInput("file", route) {
+				normalized = append(normalized, downgradedResponsesInputTextBlock("file", part))
+				continue
+			}
 			source := cloneMap(sourceMap(part["source"]))
 			if len(source) == 0 {
 				source = buildAnthropicDocumentSource(part)
@@ -226,6 +243,10 @@ func normalizeMessagesContent(parts []any) []any {
 				})
 			}
 		case "audio", "input_audio":
+			if shouldDowngradeMessagesInput("audio", route) {
+				normalized = append(normalized, downgradedResponsesInputTextBlock("audio", part))
+				continue
+			}
 			source := cloneMap(sourceMap(part["source"]))
 			if len(source) == 0 {
 				source = buildAnthropicAudioSource(part)
@@ -264,6 +285,139 @@ func normalizeMessagesContent(parts []any) []any {
 		}
 	}
 	return normalized
+}
+
+func allowMessagesThinking(cfg Config, route RouteEntry) bool {
+	if cfg.ReasoningMode == ReasoningThinking || cfg.ReasoningMode == ReasoningThinkingOnly {
+		return true
+	}
+
+	features := routeFeatureSet(route)
+	if hasAnyFeature(features, "thinking", "thinking_only", "thinking-only") {
+		return true
+	}
+
+	reasoning := strings.ToLower(strings.TrimSpace(route.Reasoning))
+	return strings.Contains(reasoning, "thinking_only") ||
+		strings.Contains(reasoning, "thinking.type") ||
+		strings.Contains(reasoning, "top-level thinking") ||
+		strings.Contains(reasoning, "supports thinking")
+}
+
+func shouldDowngradeMessagesInput(kind string, route RouteEntry) bool {
+	features := routeFeatureSet(route)
+	if !routeHasExplicitInputModalities(features) {
+		return false
+	}
+
+	switch kind {
+	case "image":
+		return !hasAnyFeature(features, "image", "vision", "multimodal", "multi-modal")
+	case "file":
+		return !hasAnyFeature(features, "file", "files", "document", "documents", "multimodal", "multi-modal")
+	case "audio":
+		return !hasAnyFeature(features, "audio", "multimodal", "multi-modal")
+	default:
+		return false
+	}
+}
+
+func routeHasExplicitInputModalities(features map[string]struct{}) bool {
+	return hasAnyFeature(features,
+		"text", "text-only", "text_only",
+		"image", "vision",
+		"file", "files", "document", "documents",
+		"audio",
+		"multimodal", "multi-modal",
+	)
+}
+
+func routeFeatureSet(route RouteEntry) map[string]struct{} {
+	if len(route.Features) == 0 {
+		return nil
+	}
+	features := make(map[string]struct{}, len(route.Features))
+	for _, feature := range route.Features {
+		normalized := strings.Trim(strings.ToLower(strings.TrimSpace(feature)), "/")
+		if normalized == "" {
+			continue
+		}
+		features[normalized] = struct{}{}
+	}
+	return features
+}
+
+func hasAnyFeature(features map[string]struct{}, candidates ...string) bool {
+	for _, candidate := range candidates {
+		if _, ok := features[candidate]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func downgradedResponsesInputMessage(kind string, item map[string]any) (map[string]any, bool) {
+	block := downgradedResponsesInputTextBlock(kind, item)
+	text := stringValue(block["text"])
+	if text == "" {
+		return nil, false
+	}
+	return map[string]any{
+		"role": "user",
+		"content": []any{
+			block,
+		},
+	}, true
+}
+
+func downgradedResponsesInputTextBlock(kind string, item map[string]any) map[string]any {
+	return map[string]any{
+		"type": "text",
+		"text": describeDowngradedResponsesInput(kind, item),
+	}
+}
+
+func describeDowngradedResponsesInput(kind string, item map[string]any) string {
+	var details []string
+	switch kind {
+	case "image":
+		if fileID := firstNonEmptyString(stringValue(item["file_id"]), stringValue(item["image_file_id"])); fileID != "" {
+			details = append(details, "file_id="+fileID)
+		}
+		if url := imageURLString(item); url != "" {
+			details = append(details, "url="+url)
+		}
+		if detail := stringValue(item["detail"]); detail != "" {
+			details = append(details, "detail="+detail)
+		}
+	case "file":
+		if fileID := stringValue(item["file_id"]); fileID != "" {
+			details = append(details, "file_id="+fileID)
+		}
+		if filename := stringValue(item["filename"]); filename != "" {
+			details = append(details, "filename="+filename)
+		}
+		if url := firstNonEmptyString(stringValue(item["file_url"]), stringValue(item["url"])); url != "" {
+			details = append(details, "url="+url)
+		}
+	case "audio":
+		audio := extractAudioPart(item)
+		if format := stringValue(audio["format"]); format != "" {
+			details = append(details, "format="+format)
+		}
+		if transcript := stringValue(audio["transcript"]); transcript != "" {
+			details = append(details, "transcript="+transcript)
+		}
+		if data := stringValue(audio["data"]); data != "" {
+			details = append(details, "data=base64")
+		}
+	}
+
+	prefix := "[" + kind + " input]"
+	if len(details) == 0 {
+		return prefix
+	}
+	return prefix + " " + strings.Join(details, " ")
 }
 
 func extractMessagesReasoningText(item map[string]any) string {

@@ -141,7 +141,7 @@ func (s *Server) forwardResponsesAsChat(w http.ResponseWriter, r *http.Request, 
 }
 
 func (s *Server) forwardResponsesAsMessages(w http.ResponseWriter, r *http.Request, body map[string]any, route RouteEntry) {
-	messagesRequest := ConvertResponsesToMessages(body, s.config)
+	messagesRequest := ConvertResponsesToMessages(body, s.config, route)
 
 	if boolValue(messagesRequest["stream"]) {
 		s.streamMessages(w, r, body, messagesRequest, s.routeEndpointURL(route, RouteProtocolMessages))

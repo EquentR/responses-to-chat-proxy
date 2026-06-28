@@ -487,6 +487,66 @@ func TestMessagesOnlyUpstreamCanServeResponsesRequests(t *testing.T) {
 	}
 }
 
+func TestMessagesOnlyUpstreamUsesRouteFeaturesForThinkingAndDowngrade(t *testing.T) {
+	var upstreamBody map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&upstreamBody); err != nil {
+			t.Fatalf("Decode upstream body returned error: %v", err)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":   "msg-route",
+			"type": "message",
+			"role": "assistant",
+			"content": []any{
+				map[string]any{"type": "text", "text": "Hi"},
+			},
+		})
+	}))
+	defer upstream.Close()
+
+	server := newRouteAwareTestServer(upstream.URL+"/v1", "upstream-secret")
+	identity := RouteIdentityKey(server.config.UpstreamBaseURL, server.config.UpstreamAPIKey)
+	server.routeTable.Store(identity, "messages-model", RouteEntry{
+		ModelID:    "messages-model",
+		Protocol:   RouteProtocolMessages,
+		Endpoint:   "/v1/messages",
+		Confidence: RouteConfidenceExplicit,
+		Features:   []string{"text", "thinking"},
+	})
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+		"model":"messages-model",
+		"reasoning":{"effort":"high"},
+		"input":[
+			{"type":"input_image","image_url":"https://example.com/image.png"},
+			{"type":"input_audio","input_audio":{"format":"wav","data":"QUJD"}}
+		]
+	}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if thinking, _ := upstreamBody["thinking"].(map[string]any); thinking["type"] != "enabled" {
+		t.Fatalf("expected route features to enable thinking, got %#v", upstreamBody["thinking"])
+	}
+
+	messages, _ := upstreamBody["messages"].([]any)
+	if len(messages) != 2 {
+		t.Fatalf("expected two downgraded user messages, got %#v", upstreamBody["messages"])
+	}
+	for _, raw := range messages {
+		message, _ := raw.(map[string]any)
+		content, _ := message["content"].([]any)
+		if len(content) != 1 || content[0].(map[string]any)["type"] != "text" {
+			t.Fatalf("expected route text-only downgrade, got %#v", message)
+		}
+	}
+}
+
 func TestChatCompletionsPassesThroughOnlyWhenRouteIsChat(t *testing.T) {
 	t.Run("route chat passes through", func(t *testing.T) {
 		var upstreamPath string
