@@ -23,7 +23,7 @@ func ConvertResponsesToMessages(data map[string]any, cfg Config) map[string]any 
 	if system := stringValue(data["instructions"]); system != "" {
 		result["system"] = system
 	}
-	if thinking := convertResponsesThinking(data["reasoning"]); thinking != nil {
+	if thinking := convertResponsesThinking(data["reasoning"], cfg); thinking != nil {
 		result["thinking"] = thinking
 	}
 	if maxOutput := data["max_output_tokens"]; maxOutput != nil {
@@ -41,9 +41,12 @@ func ConvertResponsesToMessages(data map[string]any, cfg Config) map[string]any 
 	return result
 }
 
-func convertResponsesThinking(raw any) map[string]any {
+func convertResponsesThinking(raw any, cfg Config) map[string]any {
 	reasoning, _ := raw.(map[string]any)
 	if len(reasoning) == 0 {
+		return nil
+	}
+	if cfg.ReasoningMode != ReasoningThinking && cfg.ReasoningMode != ReasoningThinkingOnly {
 		return nil
 	}
 	effort := strings.ToLower(stringValue(reasoning["effort"]))
@@ -917,7 +920,10 @@ func (c *MessagesStreamingConverter) handleContentBlockStart(payload map[string]
 		return nil
 	}
 
-	if stringValue(block["type"]) == "tool_use" {
+	switch stringValue(block["type"]) {
+	case "thinking", "redacted_thinking":
+		c.collectReasoningBlock(block)
+	case "tool_use":
 		entry := c.ensureToolCall(index)
 		entry.id = firstNonEmptyString(stringValue(block["id"]), entry.id)
 		entry.name = firstNonEmptyString(stringValue(block["name"]), entry.name)
@@ -967,7 +973,7 @@ func (c *MessagesStreamingConverter) handleContentBlockDelta(payload map[string]
 		if text == "" {
 			return nil
 		}
-		c.reasoning.WriteString(text)
+		c.appendReasoning(text)
 		return []string{sseEvent("response.reasoning_text.delta", map[string]any{
 			"item_id":       c.reasoningItemID(),
 			"output_index":  c.reasoningOutputIndexValue(),
@@ -1095,6 +1101,35 @@ func (c *MessagesStreamingConverter) buildOutput() []any {
 		output = append(output, item)
 	}
 	return output
+}
+
+func (c *MessagesStreamingConverter) collectReasoningBlock(block map[string]any) {
+	var parts []string
+	switch stringValue(block["type"]) {
+	case "thinking":
+		collectMessagesReasoning(&parts, firstNonEmptyString(stringValue(block["thinking"]), stringValue(block["text"])))
+		collectMessagesReasoning(&parts, block["content"])
+		collectMessagesReasoning(&parts, block["summary"])
+	case "redacted_thinking":
+		collectMessagesReasoning(&parts, block["data"])
+		collectMessagesReasoning(&parts, block["text"])
+		collectMessagesReasoning(&parts, block["content"])
+	}
+
+	for _, part := range parts {
+		c.appendReasoning(part)
+	}
+}
+
+func (c *MessagesStreamingConverter) appendReasoning(text string) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return
+	}
+	if c.reasoning.Len() > 0 {
+		c.reasoning.WriteString("\n")
+	}
+	c.reasoning.WriteString(text)
 }
 
 func (c *MessagesStreamingConverter) ensureToolCall(index int) *messagesStreamToolCall {
