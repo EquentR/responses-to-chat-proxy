@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"unicode"
 )
 
 // ---------------------------------------------------------------------------
@@ -23,6 +24,160 @@ type toolContext struct {
 	seenChatNames           map[string]struct{}
 	chatNameToSpec          map[string]*toolSpec
 	namespaceNameToChatName map[string]string
+}
+
+type normalizedInputMessage struct {
+	role    string
+	content any
+}
+
+type normalizedContentPart struct {
+	kind string
+	data map[string]any
+}
+
+type messageTextParts struct {
+	reasoningParts []string
+	visibleParts   []string
+	visibleThink   thinkTextAccumulator
+}
+
+func (p *messageTextParts) addReasoning(text string) {
+	if strings.TrimSpace(text) != "" {
+		p.reasoningParts = append(p.reasoningParts, text)
+	}
+}
+
+func (p *messageTextParts) addVisible(text string) {
+	if text != "" {
+		p.visibleParts = append(p.visibleParts, text)
+	}
+}
+
+func (p *messageTextParts) collectReasoning(value any) {
+	switch typed := value.(type) {
+	case nil:
+		return
+	case string:
+		reasoning, _, found := splitThinkText(typed)
+		if found {
+			p.addReasoning(reasoning)
+			return
+		}
+		p.addReasoning(typed)
+	case []string:
+		for _, item := range typed {
+			p.addReasoning(item)
+		}
+	case []any:
+		for _, item := range typed {
+			p.collectReasoning(item)
+		}
+	case map[string]any:
+		p.collectReasoningMap(typed)
+	default:
+		p.addReasoning(stringValue(typed))
+	}
+}
+
+func (p *messageTextParts) collectReasoningDetails(value any) {
+	p.collectReasoning(value)
+}
+
+func (p *messageTextParts) collectReasoningMap(value map[string]any) {
+	switch stringValue(value["type"]) {
+	case "thinking":
+		p.collectReasoning(value["thinking"])
+		p.collectReasoning(value["text"])
+		p.collectReasoning(value["content"])
+		p.collectReasoning(value["data"])
+		p.collectReasoning(value["summary"])
+		p.collectReasoning(value["reasoning"])
+		return
+	case "redacted_thinking":
+		p.collectReasoning(value["data"])
+		p.collectReasoning(value["text"])
+		p.collectReasoning(value["content"])
+		p.collectReasoning(value["thinking"])
+		return
+	case "summary_text", "reasoning_text":
+		p.collectReasoning(value["text"])
+		p.collectReasoning(value["content"])
+		return
+	case "reasoning":
+		p.collectReasoning(value["summary"])
+		p.collectReasoning(value["content"])
+		p.collectReasoning(value["details"])
+		p.collectReasoning(value["reasoning_details"])
+		p.collectReasoning(value["text"])
+		p.collectReasoning(value["thinking"])
+		p.collectReasoning(value["data"])
+		return
+	}
+
+	for _, key := range []string{"summary", "content", "details", "reasoning_details", "items", "blocks"} {
+		if child, ok := value[key]; ok {
+			p.collectReasoning(child)
+		}
+	}
+
+	for _, key := range []string{"thinking", "text", "data", "reasoning"} {
+		if child, ok := value[key]; ok {
+			p.collectReasoning(child)
+		}
+	}
+}
+
+func (p *messageTextParts) collectVisible(value any) {
+	switch typed := value.(type) {
+	case nil:
+		return
+	case string:
+		reasoning, visible := p.visibleThink.consume(typed)
+		p.addReasoning(reasoning)
+		p.addVisible(visible)
+	case []string:
+		for _, item := range typed {
+			p.addVisible(item)
+		}
+	case []any:
+		for _, item := range typed {
+			p.collectVisible(item)
+		}
+	case map[string]any:
+		switch stringValue(typed["type"]) {
+		case "thinking", "redacted_thinking", "summary_text", "reasoning_text", "reasoning":
+			p.collectReasoning(typed)
+			return
+		case "text", "output_text", "input_text":
+			if text := stringValue(typed["text"]); text != "" {
+				p.collectVisible(text)
+				return
+			}
+			if text := stringValue(typed["content"]); text != "" {
+				p.collectVisible(text)
+				return
+			}
+		}
+
+		if text := stringValue(typed["text"]); text != "" {
+			p.collectVisible(text)
+		}
+		if content, ok := typed["content"]; ok {
+			p.collectVisible(content)
+		}
+		if output := stringValue(typed["output"]); output != "" {
+			p.collectVisible(output)
+		}
+	default:
+		p.addVisible(stringValue(typed))
+	}
+}
+
+func (p *messageTextParts) finishVisibleThinking() {
+	reasoning, visible := p.visibleThink.finish()
+	p.addReasoning(reasoning)
+	p.addVisible(visible)
 }
 
 func newToolContext() *toolContext {
@@ -132,9 +287,9 @@ func ConvertRequest(data map[string]any, cfg Config) map[string]any {
 		messages = append(messages, map[string]any{"role": "user", "content": input})
 	case []any:
 		for _, item := range input {
-			msg, ok := convertInputItem(item, tc)
+			msg, ok := normalizeInputItem(item, tc)
 			if ok {
-				messages = append(messages, msg)
+				messages = append(messages, msg.toChatMessage())
 			}
 		}
 	}
@@ -165,7 +320,7 @@ func ConvertRequest(data map[string]any, cfg Config) map[string]any {
 
 	// ---- tools ----
 	if len(tc.chatTools) > 0 {
-		chatData["tools"] = tc.chatTools
+		chatData["tools"] = mapSliceToAny(tc.chatTools)
 	}
 
 	// ---- tool_choice ----
@@ -314,6 +469,7 @@ func ConvertResponse(chatResp, originalReq map[string]any) map[string]any {
 
 	var output []any
 	reasoningText, messageText := extractReasoningAndMessage(message)
+	status, incompleteDetails := mapFinishReasonForOutput(finishReason, nil)
 
 	if reasoningText != "" {
 		suffix := strings.TrimPrefix(responseID, "resp-")
@@ -337,7 +493,8 @@ func ConvertResponse(chatResp, originalReq map[string]any) map[string]any {
 
 	output = append(output, buildToolOutputItems(message, responseID, tc)...)
 
-	status, incompleteDetails := mapFinishReason(finishReason)
+	status, incompleteDetails = mapFinishReasonForOutput(finishReason, output)
+	output = finalizeOutputItems(output, status)
 
 	usage := convertUsage(chatResp["usage"])
 	if reasoningText != "" {
@@ -372,67 +529,173 @@ func ConvertResponse(chatResp, originalReq map[string]any) map[string]any {
 }
 
 func extractReasoningAndMessage(message map[string]any) (reasoning, visible string) {
-	if rc := stringValue(message["reasoning_content"]); rc != "" {
-		reasoning = rc
-	}
+	parts := messageTextParts{}
+	parts.collectReasoning(message["reasoning_content"])
+	parts.collectReasoning(message["reasoning"])
+	parts.collectReasoningDetails(message["reasoning_details"])
+	parts.collectVisible(message["content"])
+	parts.finishVisibleThinking()
 
-	if details, _ := message["reasoning_details"].([]any); len(details) > 0 && reasoning == "" {
-		var parts []string
-		for _, d := range details {
-			if dm, ok := d.(map[string]any); ok {
-				parts = append(parts, stringValue(dm["text"]))
+	return strings.Join(parts.reasoningParts, "\n"), strings.Join(parts.visibleParts, "")
+}
+
+func finalizeOutputItems(output []any, responseStatus string) []any {
+	if responseStatus == "failed" {
+		var kept []any
+		for _, raw := range output {
+			item, ok := raw.(map[string]any)
+			if !ok || hasSubstantiveResponseOutput([]any{item}) {
+				kept = append(kept, raw)
 			}
 		}
-		reasoning = strings.Join(parts, "\n")
+		return kept
 	}
-
-	if contentArr, ok := message["content"].([]any); ok {
-		var textParts, thinkParts []string
-		for _, block := range contentArr {
-			bm, _ := block.(map[string]any)
-			switch stringValue(bm["type"]) {
-			case "thinking":
-				thinkParts = append(thinkParts, stringValue(bm["thinking"]))
-			case "redacted_thinking":
-				thinkParts = append(thinkParts, stringValue(bm["data"]))
-			case "text":
-				textParts = append(textParts, stringValue(bm["text"]))
-			}
+	for _, raw := range output {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			continue
 		}
-		if reasoning == "" && len(thinkParts) > 0 {
-			reasoning = strings.Join(thinkParts, "\n")
-		}
-		visible = strings.Join(textParts, "")
-	}
-
-	if contentStr := stringValue(message["content"]); contentStr != "" {
-		if visible == "" {
-			visible = contentStr
-		}
-		if reasoning == "" {
-			reasoning, visible = splitThinkTag(contentStr)
+		if stringValue(item["status"]) == "in_progress" {
+			item["status"] = "completed"
 		}
 	}
+	return output
+}
 
-	return reasoning, visible
+type thinkTextAccumulator struct {
+	insideThink                  bool
+	expectedClose                string
+	carry                        string
+	foundTag                     bool
+	skipLeadingVisibleWhitespace bool
+}
+
+var thinkOpenTags = []string{"<think>", "<thinking>"}
+
+func splitThinkText(text string) (reasoning, visible string, found bool) {
+	var acc thinkTextAccumulator
+	reasoning, visible = acc.consume(text)
+	reasoning2, visible2 := acc.finish()
+	return reasoning + reasoning2, visible + visible2, acc.foundTag
 }
 
 func splitThinkTag(content string) (reasoning, visible string) {
-	for _, tag := range []string{"<think>", "<thinking>"} {
-		after, found := strings.CutPrefix(content, tag)
-		if !found {
+	reasoning, visible, _ = splitThinkText(content)
+	return reasoning, visible
+}
+
+func (a *thinkTextAccumulator) consume(text string) (reasoning, visible string) {
+	buf := a.carry + text
+	a.carry = ""
+	var reasoningParts, visibleParts strings.Builder
+
+	for len(buf) > 0 {
+		if a.skipLeadingVisibleWhitespace && !a.insideThink {
+			buf = strings.TrimLeftFunc(buf, unicode.IsSpace)
+			if buf == "" {
+				break
+			}
+			a.skipLeadingVisibleWhitespace = false
+		}
+
+		if !a.insideThink {
+			idx, tag := findThinkTag(buf, thinkOpenTags)
+			if idx >= 0 {
+				if idx > 0 {
+					visibleParts.WriteString(buf[:idx])
+				}
+				buf = buf[idx+len(tag):]
+				a.insideThink = true
+				a.expectedClose = matchingThinkCloseTag(tag)
+				a.foundTag = true
+				continue
+			}
+
+			keep := longestThinkPrefixSuffix(buf, thinkOpenTags)
+			if keep > 0 {
+				if len(buf) > keep {
+					visibleParts.WriteString(buf[:len(buf)-keep])
+				}
+				a.carry = buf[len(buf)-keep:]
+			} else {
+				visibleParts.WriteString(buf)
+			}
+			break
+		}
+
+		idx, _ := findThinkTag(buf, []string{a.expectedClose})
+		if idx >= 0 {
+			if idx > 0 {
+				reasoningParts.WriteString(buf[:idx])
+			}
+			buf = buf[idx+len(a.expectedClose):]
+			a.insideThink = false
+			a.expectedClose = ""
+			a.foundTag = true
+			a.skipLeadingVisibleWhitespace = true
 			continue
 		}
-		closeTag := strings.Replace(tag, "<", "</", 1)
-		reason, rest, foundClose := strings.Cut(after, closeTag)
-		if foundClose {
-			rest = strings.TrimSpace(rest)
-			rest = strings.TrimPrefix(rest, "\n")
-			return strings.TrimSpace(reason), rest
+
+		keep := longestThinkPrefixSuffix(buf, []string{a.expectedClose})
+		if keep > 0 {
+			if len(buf) > keep {
+				reasoningParts.WriteString(buf[:len(buf)-keep])
+			}
+			a.carry = buf[len(buf)-keep:]
+		} else {
+			reasoningParts.WriteString(buf)
 		}
-		return strings.TrimSpace(after), ""
+		break
 	}
-	return "", content
+
+	return reasoningParts.String(), visibleParts.String()
+}
+
+func (a *thinkTextAccumulator) finish() (reasoning, visible string) {
+	if a.carry == "" {
+		return "", ""
+	}
+	if a.insideThink {
+		reasoning = a.carry
+	} else {
+		visible = a.carry
+	}
+	a.carry = ""
+	return reasoning, visible
+}
+
+func findThinkTag(text string, tags []string) (index int, tag string) {
+	index = -1
+	for _, candidate := range tags {
+		if i := strings.Index(text, candidate); i >= 0 {
+			if index < 0 || i < index || (i == index && len(candidate) > len(tag)) {
+				index = i
+				tag = candidate
+			}
+		}
+	}
+	return index, tag
+}
+
+func matchingThinkCloseTag(openTag string) string {
+	switch openTag {
+	case "<thinking>":
+		return "</thinking>"
+	default:
+		return "</think>"
+	}
+}
+
+func longestThinkPrefixSuffix(text string, tags []string) int {
+	maxKeep := 0
+	for _, tag := range tags {
+		for keep := 1; keep < len(tag) && keep <= len(text); keep++ {
+			if strings.HasSuffix(text, tag[:keep]) && keep > maxKeep {
+				maxKeep = keep
+			}
+		}
+	}
+	return maxKeep
 }
 
 func estimateReasoningTokens(text string) int {
@@ -443,10 +706,10 @@ func estimateReasoningTokens(text string) int {
 // Input item conversion
 // ===========================================================================
 
-func convertInputItem(item any, tc *toolContext) (map[string]any, bool) {
+func normalizeInputItem(item any, tc *toolContext) (normalizedInputMessage, bool) {
 	dict, ok := item.(map[string]any)
 	if !ok {
-		return nil, false
+		return normalizedInputMessage{}, false
 	}
 
 	itemType := stringValue(dict["type"])
@@ -458,11 +721,29 @@ func convertInputItem(item any, tc *toolContext) (map[string]any, bool) {
 			}
 		}
 		if stringValue(dict["execution"]) == "server" {
-			return nil, false
+			return normalizedInputMessage{}, false
 		}
-		return map[string]any{
-			"role":    "system",
-			"content": "Loaded tools: " + stringValue(dict["call_id"]),
+		return normalizedInputMessage{
+			role:    "system",
+			content: "Loaded tools: " + stringValue(dict["call_id"]),
+		}, true
+	}
+
+	switch itemType {
+	case "input_text":
+		text := stringValue(dict["text"])
+		if text == "" {
+			text = stringValue(dict["content"])
+		}
+		return normalizedInputMessage{role: "user", content: text}, true
+	case "input_image", "input_file", "input_audio":
+		part, ok := normalizeStandaloneContentPart(dict)
+		if !ok {
+			return normalizedInputMessage{}, false
+		}
+		return normalizedInputMessage{
+			role:    "user",
+			content: []normalizedContentPart{part},
 		}, true
 	}
 
@@ -479,34 +760,12 @@ func convertInputItem(item any, tc *toolContext) (map[string]any, bool) {
 
 		content := dict["content"]
 		if contentList, ok := content.([]any); ok {
-			converted := make([]any, 0, len(contentList))
-			var textBuilder strings.Builder
-			allText := true
-			for _, rawPart := range contentList {
-				part, ok := rawPart.(map[string]any)
-				if !ok {
-					allText = false
-					continue
-				}
-				cp, ok := convertContentPart(part)
-				if !ok {
-					allText = false
-					continue
-				}
-				converted = append(converted, cp)
-				if stringValue(cp["type"]) != "text" {
-					allText = false
-				} else {
-					textBuilder.WriteString(stringValue(cp["text"]))
-				}
-			}
-			if allText {
-				content = textBuilder.String()
-			} else {
-				content = converted
+			normalized, ok := normalizeContentList(contentList)
+			if ok {
+				content = normalized
 			}
 		}
-		return map[string]any{"role": role, "content": content}, true
+		return normalizedInputMessage{role: role, content: content}, true
 	}
 
 	if itemType == "function_call" {
@@ -514,16 +773,18 @@ func convertInputItem(item any, tc *toolContext) (map[string]any, bool) {
 		if callID == "" {
 			callID = stringValue(dict["id"])
 		}
-		return map[string]any{
-			"role":    "assistant",
-			"content": nil,
-			"tool_calls": []any{
-				map[string]any{
-					"id":   callID,
-					"type": "function",
-					"function": map[string]any{
-						"name":      stringValue(dict["name"]),
-						"arguments": valueOrDefault(dict["arguments"], "{}"),
+		return normalizedInputMessage{
+			role: "assistant",
+			content: map[string]any{
+				"content": nil,
+				"tool_calls": []any{
+					map[string]any{
+						"id":   callID,
+						"type": "function",
+						"function": map[string]any{
+							"name":      stringValue(dict["name"]),
+							"arguments": valueOrDefault(dict["arguments"], "{}"),
+						},
 					},
 				},
 			},
@@ -531,35 +792,178 @@ func convertInputItem(item any, tc *toolContext) (map[string]any, bool) {
 	}
 
 	if itemType == "function_call_output" {
-		return map[string]any{
-			"role":         "tool",
-			"tool_call_id": stringValue(dict["call_id"]),
-			"content":      stringValue(dict["output"]),
+		return normalizedInputMessage{
+			role: "tool",
+			content: map[string]any{
+				"tool_call_id": stringValue(dict["call_id"]),
+				"content":      stringValue(dict["output"]),
+			},
 		}, true
 	}
 
-	return nil, false
+	return normalizedInputMessage{}, false
 }
 
-func convertContentPart(part map[string]any) (map[string]any, bool) {
+func (m normalizedInputMessage) toChatMessage() map[string]any {
+	message := map[string]any{"role": m.role}
+	switch content := m.content.(type) {
+	case nil:
+		message["content"] = nil
+	case string:
+		message["content"] = content
+	case []normalizedContentPart:
+		message["content"] = renderNormalizedContentParts(content)
+	case map[string]any:
+		for k, v := range content {
+			message[k] = v
+		}
+	default:
+		message["content"] = content
+	}
+	return message
+}
+
+func renderNormalizedContentParts(parts []normalizedContentPart) any {
+	rendered := make([]any, 0, len(parts))
+	var textBuilder strings.Builder
+	allText := true
+	for _, part := range parts {
+		cp := part.toChatPart()
+		rendered = append(rendered, cp)
+		if stringValue(cp["type"]) != "text" {
+			allText = false
+			continue
+		}
+		textBuilder.WriteString(stringValue(cp["text"]))
+	}
+	if len(rendered) == 0 {
+		return []any{}
+	}
+	if allText {
+		return textBuilder.String()
+	}
+	return rendered
+}
+
+func normalizeContentList(contentList []any) ([]normalizedContentPart, bool) {
+	normalized := make([]normalizedContentPart, 0, len(contentList))
+	for _, rawPart := range contentList {
+		part, ok := rawPart.(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		cp, ok := normalizeContentPart(part)
+		if !ok {
+			return nil, false
+		}
+		normalized = append(normalized, cp)
+	}
+	return normalized, true
+}
+
+func normalizeStandaloneContentPart(part map[string]any) (normalizedContentPart, bool) {
+	return normalizeContentPart(part)
+}
+
+func normalizeContentPart(part map[string]any) (normalizedContentPart, bool) {
 	switch stringValue(part["type"]) {
 	case "input_text", "output_text":
-		return map[string]any{"type": "text", "text": stringValue(part["text"])}, true
+		return normalizedContentPart{
+			kind: "text",
+			data: map[string]any{"text": stringValue(part["text"])},
+		}, true
 	case "input_image":
-		url := extractImageURL(part)
-		return map[string]any{"type": "image_url", "image_url": map[string]any{"url": url}}, true
+		image := extractImageURLPart(part)
+		if len(image) == 0 {
+			return normalizedContentPart{}, false
+		}
+		return normalizedContentPart{
+			kind: "image_url",
+			data: map[string]any{"image_url": image},
+		}, true
 	case "input_file":
-		return nil, false
+		file := extractFilePart(part)
+		if len(file) == 0 {
+			return normalizedContentPart{}, false
+		}
+		return normalizedContentPart{
+			kind: "file",
+			data: map[string]any{"file": file},
+		}, true
+	case "input_audio":
+		audio := extractAudioPart(part)
+		if len(audio) == 0 {
+			return normalizedContentPart{}, false
+		}
+		return normalizedContentPart{
+			kind: "input_audio",
+			data: map[string]any{"input_audio": audio},
+		}, true
 	default:
-		return part, true
+		return normalizedContentPart{
+			kind: stringValue(part["type"]),
+			data: cloneMap(part),
+		}, true
 	}
 }
 
-func extractImageURL(part map[string]any) string {
-	if url, ok := part["image_url"].(map[string]any); ok {
-		return stringValue(url["url"])
+func (p normalizedContentPart) toChatPart() map[string]any {
+	part := cloneMap(p.data)
+	part["type"] = p.kind
+	return part
+}
+
+func extractImageURLPart(part map[string]any) map[string]any {
+	if image, ok := part["image_url"].(map[string]any); ok {
+		return cloneMap(image)
 	}
-	return stringValue(part["image_url"])
+	if url := stringValue(part["image_url"]); url != "" {
+		image := map[string]any{"url": url}
+		if detail := stringValue(part["detail"]); detail != "" {
+			image["detail"] = detail
+		}
+		return image
+	}
+	if url := stringValue(part["url"]); url != "" {
+		image := map[string]any{"url": url}
+		if detail := stringValue(part["detail"]); detail != "" {
+			image["detail"] = detail
+		}
+		return image
+	}
+	return nil
+}
+
+func extractFilePart(part map[string]any) map[string]any {
+	if file, ok := part["file"].(map[string]any); ok {
+		return cloneMap(file)
+	}
+	file := map[string]any{}
+	for _, key := range []string{"file_id", "file_data", "file_url", "filename", "mime_type"} {
+		if value, ok := part[key]; ok {
+			file[key] = value
+		}
+	}
+	if len(file) == 0 {
+		return nil
+	}
+	return file
+}
+
+func extractAudioPart(part map[string]any) map[string]any {
+	if audio, ok := part["input_audio"].(map[string]any); ok {
+		return cloneMap(audio)
+	}
+	audio := map[string]any{}
+	for _, key := range []string{"data", "format", "transcript"} {
+		if value, ok := part[key]; ok {
+			audio[key] = value
+		}
+	}
+	if len(audio) == 0 {
+		return nil
+	}
+	return audio
 }
 
 // ===========================================================================
@@ -631,6 +1035,10 @@ func (tc *toolContext) addCustomTool(name, desc string) {
 	if desc == "" {
 		desc = customToolInputDesc
 	}
+	inputDesc := customToolInputDesc
+	if desc != customToolInputDesc {
+		inputDesc += "\n\n" + desc
+	}
 	chatTool := map[string]any{
 		"type": "function",
 		"function": map[string]any{
@@ -641,7 +1049,7 @@ func (tc *toolContext) addCustomTool(name, desc string) {
 				"properties": map[string]any{
 					customToolInputField: map[string]any{
 						"type":        "string",
-						"description": customToolInputDesc,
+						"description": inputDesc,
 					},
 				},
 				"required": []any{customToolInputField},
@@ -728,11 +1136,26 @@ func responsesToChatFunctionTool(tool map[string]any, chatName string) map[strin
 }
 
 func buildCustomToolDesc(tool map[string]any) string {
+	definition, err := json.MarshalIndent(tool, "", "  ")
+	if err == nil && len(definition) > 0 {
+		return customToolPreservedHeader + "\n" + string(definition)
+	}
 	desc := stringValue(tool["description"])
 	if desc == "" {
 		desc = stringValue(tool["name"])
 	}
 	return customToolPreservedHeader + "\n" + desc
+}
+
+func mapSliceToAny(values []map[string]any) []any {
+	if len(values) == 0 {
+		return []any{}
+	}
+	result := make([]any, len(values))
+	for i, value := range values {
+		result[i] = value
+	}
+	return result
 }
 
 // ---- legacy convertTools (used by tests) ----
@@ -789,9 +1212,7 @@ func buildOutputItem(message map[string]any, responseID, finishReason string, tc
 	if role == "" {
 		role = "assistant"
 	}
-	suffix := strings.TrimPrefix(responseID, "resp-")
-	suffix = strings.TrimPrefix(suffix, "resp_")
-	itemID := "msg_" + suffix
+	itemID := "msg_" + responseSuffix(responseID)
 
 	outputItem := map[string]any{
 		"type":    "message",
@@ -803,9 +1224,9 @@ func buildOutputItem(message map[string]any, responseID, finishReason string, tc
 
 	switch content := message["content"].(type) {
 	case string:
-		if content != "" {
+		if messageText != "" {
 			outputItem["content"] = []any{map[string]any{
-				"type": "output_text", "text": content, "annotations": []any{},
+				"type": "output_text", "text": messageText, "annotations": []any{},
 			}}
 		}
 	case nil:
@@ -816,19 +1237,25 @@ func buildOutputItem(message map[string]any, responseID, finishReason string, tc
 		}
 	case []any:
 		var textContent []any
+		var contentThink thinkTextAccumulator
 		for _, rawPart := range content {
 			part, ok := rawPart.(map[string]any)
 			if !ok {
 				continue
 			}
 			pt := stringValue(part["type"])
-			if pt == "thinking" || pt == "redacted_thinking" {
+			if isReasoningContentPartType(pt) {
 				continue
 			}
-			converted := convertOutputPartWithoutThinking(part)
+			converted := convertOutputPartWithoutThinking(part, &contentThink)
 			if converted != nil {
 				textContent = append(textContent, converted)
 			}
+		}
+		if _, visible := contentThink.finish(); visible != "" {
+			textContent = append(textContent, map[string]any{
+				"type": "output_text", "text": visible, "annotations": []any{},
+			})
 		}
 		outputItem["content"] = textContent
 	}
@@ -836,13 +1263,47 @@ func buildOutputItem(message map[string]any, responseID, finishReason string, tc
 	return outputItem
 }
 
-func convertOutputPartWithoutThinking(part map[string]any) map[string]any {
-	if stringValue(part["type"]) == "text" {
+func convertOutputPartWithoutThinking(part map[string]any, acc *thinkTextAccumulator) map[string]any {
+	if visible, ok := visibleOutputText(part, acc); ok {
+		if visible == "" {
+			return nil
+		}
 		return map[string]any{
-			"type": "output_text", "text": stringValue(part["text"]), "annotations": []any{},
+			"type": "output_text", "text": visible, "annotations": []any{},
 		}
 	}
 	return part
+}
+
+func visibleOutputText(part map[string]any, acc *thinkTextAccumulator) (string, bool) {
+	for _, key := range []string{"text", "content", "output"} {
+		if visible, ok := splitThinkVisibleString(part[key], acc); ok {
+			return visible, true
+		}
+	}
+	return "", false
+}
+
+func splitThinkVisibleString(value any, acc *thinkTextAccumulator) (string, bool) {
+	text := stringValue(value)
+	if text == "" {
+		return "", false
+	}
+	if acc == nil {
+		_, visible, _ := splitThinkText(text)
+		return visible, true
+	}
+	_, visible := acc.consume(text)
+	return visible, true
+}
+
+func isReasoningContentPartType(partType string) bool {
+	switch partType {
+	case "thinking", "redacted_thinking", "summary_text", "reasoning_text", "reasoning":
+		return true
+	default:
+		return false
+	}
 }
 
 func buildToolOutputItems(message map[string]any, responseID string, tc *toolContext) []any {
@@ -850,17 +1311,17 @@ func buildToolOutputItems(message map[string]any, responseID string, tc *toolCon
 	suffix = strings.TrimPrefix(suffix, "resp_")
 	toolCalls, _ := message["tool_calls"].([]any)
 	var items []any
-	for _, raw := range toolCalls {
+	for index, raw := range toolCalls {
 		tcMap, ok := raw.(map[string]any)
 		if !ok {
 			continue
 		}
-		items = append(items, restoreToolCall(tcMap, suffix, tc))
+		items = append(items, restoreToolCall(tcMap, suffix, index, tc))
 	}
 	return items
 }
 
-func restoreToolCall(toolCall map[string]any, suffix string, tc *toolContext) map[string]any {
+func restoreToolCall(toolCall map[string]any, suffix string, index int, tc *toolContext) map[string]any {
 	fn, _ := toolCall["function"].(map[string]any)
 	chatName := stringValue(fn["name"])
 	callID := stringValue(toolCall["id"])
@@ -868,9 +1329,13 @@ func restoreToolCall(toolCall map[string]any, suffix string, tc *toolContext) ma
 
 	spec := tc.chatNameToSpec[chatName]
 	if spec == nil {
+		id := toolCallFallbackID("fc_", suffix, index)
+		if callID != "" {
+			id = "fc_" + strings.TrimPrefix(callID, "call_")
+		}
 		return map[string]any{
 			"type":      "function_call",
-			"id":        "fc_" + strings.TrimPrefix(callID, "call_"),
+			"id":        id,
 			"call_id":   callID,
 			"status":    "completed",
 			"name":      chatName,
@@ -880,9 +1345,13 @@ func restoreToolCall(toolCall map[string]any, suffix string, tc *toolContext) ma
 
 	switch spec.kind {
 	case "namespace":
+		id := toolCallFallbackID("fc_", suffix, index)
+		if callID != "" {
+			id = "fc_" + strings.TrimPrefix(callID, "call_")
+		}
 		return map[string]any{
 			"type":      "function_call",
-			"id":        "fc_" + strings.TrimPrefix(callID, "call_"),
+			"id":        id,
 			"call_id":   callID,
 			"status":    "completed",
 			"namespace": spec.namespace,
@@ -890,28 +1359,40 @@ func restoreToolCall(toolCall map[string]any, suffix string, tc *toolContext) ma
 			"arguments": args,
 		}
 	case "custom":
+		id := toolCallFallbackID("ctc_", suffix, index)
+		if callID != "" {
+			id = "ctc_" + strings.TrimPrefix(callID, "call_")
+		}
 		input := extractCustomToolInput(args)
 		return map[string]any{
 			"type":    "custom_tool_call",
-			"id":      "ctc_" + strings.TrimPrefix(callID, "call_"),
+			"id":      id,
 			"call_id": callID,
 			"status":  "completed",
 			"name":    spec.name,
 			"input":   input,
 		}
 	case "tool_search":
+		id := toolCallFallbackID("tsc_", suffix, index)
+		if callID != "" {
+			id = "tsc_" + strings.TrimPrefix(callID, "call_")
+		}
 		return map[string]any{
 			"type":      "tool_search_call",
-			"id":        "tsc_" + strings.TrimPrefix(callID, "call_"),
+			"id":        id,
 			"call_id":   callID,
 			"status":    "completed",
 			"arguments": parseJSONObject(args),
 			"execution": "client",
 		}
 	default:
+		id := toolCallFallbackID("fc_", suffix, index)
+		if callID != "" {
+			id = "fc_" + strings.TrimPrefix(callID, "call_")
+		}
 		return map[string]any{
 			"type":      "function_call",
-			"id":        "fc_" + strings.TrimPrefix(callID, "call_"),
+			"id":        id,
 			"call_id":   callID,
 			"status":    "completed",
 			"name":      spec.name,
@@ -1017,6 +1498,48 @@ func mapFinishReason(finishReason string) (string, map[string]any) {
 	default:
 		return "completed", nil
 	}
+}
+
+func mapFinishReasonForOutput(finishReason string, output []any) (string, map[string]any) {
+	if finishReason != "" {
+		return mapFinishReason(finishReason)
+	}
+	if hasSubstantiveResponseOutput(output) {
+		return "incomplete", nil
+	}
+	return "failed", nil
+}
+
+func hasSubstantiveResponseOutput(output []any) bool {
+	for _, raw := range output {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch stringValue(item["type"]) {
+		case "message":
+			if content, ok := item["content"].([]any); ok {
+				for _, rawPart := range content {
+					part, _ := rawPart.(map[string]any)
+					if strings.TrimSpace(stringValue(part["text"])) != "" {
+						return true
+					}
+				}
+			}
+		case "reasoning":
+			if summary, ok := item["summary"].([]any); ok {
+				for _, rawPart := range summary {
+					part, _ := rawPart.(map[string]any)
+					if strings.TrimSpace(stringValue(part["text"])) != "" {
+						return true
+					}
+				}
+			}
+		case "function_call", "custom_tool_call", "tool_search_call":
+			return true
+		}
+	}
+	return false
 }
 
 func convertUsage(rawUsage any) map[string]any {
@@ -1206,29 +1729,53 @@ func NormalizeUpstreamError(body map[string]any) map[string]any {
 // ===========================================================================
 
 type StreamingConverter struct {
-	initialized        bool
-	outputItemAdded    bool
-	contentPartAdded   bool
-	textDone           bool
-	outputItemDone     bool
-	completed          bool
-	reasoningDone      bool
-	nextOutputIndex    int
-	messageOutputIndex *int
-	responseID         string
-	messageID          string
-	model              string
-	created            int
-	messageRole        string
-	fullText           string
-	reasoningText      string
-	toolCalls          map[int]*streamToolCall
-	sseBuffer          string
-	usage              map[string]any
-	rawReasoning       map[string]any
+	initialized          bool
+	outputItemAdded      bool
+	contentPartAdded     bool
+	textDone             bool
+	outputItemDone       bool
+	completed            bool
+	doneSent             bool
+	reasoningDone        bool
+	sawSubstantiveOutput bool
+	nextOutputIndex      int
+	messageOutputIndex   *int
+	reasoningOutputIndex *int
+	responseID           string
+	messageID            string
+	model                string
+	created              int
+	messageRole          string
+	fullText             string
+	reasoningText        string
+	contentThink         thinkTextAccumulator
+	finishReason         string
+	toolCalls            map[int]*streamToolCall
+	sseBuffer            string
+	usage                map[string]any
+	rawReasoning         map[string]any
+}
+
+type streamToolCallKind string
+
+const (
+	streamToolCallKindUnknown    streamToolCallKind = ""
+	streamToolCallKindFunction   streamToolCallKind = "function"
+	streamToolCallKindNamespace  streamToolCallKind = "namespace"
+	streamToolCallKindCustom     streamToolCallKind = "custom"
+	streamToolCallKindToolSearch streamToolCallKind = "tool_search"
+)
+
+type normalizedStreamToolCall struct {
+	kind      streamToolCallKind
+	namespace string
+	name      string
+	input     string
+	execution string
 }
 
 type streamToolCall struct {
+	spec        normalizedStreamToolCall
 	ID          string
 	ItemID      string
 	Name        string
@@ -1244,6 +1791,13 @@ func NewStreamingConverter() *StreamingConverter {
 		rawReasoning: map[string]any{},
 		usage:        map[string]any{},
 	}
+}
+
+type finalStreamingOutputItem struct {
+	outputIndex int
+	addedEvent  string
+	doneEvents  []string
+	output      map[string]any
 }
 
 func (c *StreamingConverter) Feed(chunk []byte) []string {
@@ -1286,8 +1840,24 @@ func (c *StreamingConverter) Feed(chunk []byte) []string {
 
 func (c *StreamingConverter) Finish() []string {
 	events := c.finishOutputItems()
-	events = append(events, c.finishResponse("completed")...)
+	events = append(events, c.finishResponse(c.finalStatus())...)
+	events = append(events, c.doneSentinel()...)
 	return events
+}
+
+func (c *StreamingConverter) finalStatus() string {
+	if c.finishReason == "" {
+		if c.sawSubstantiveOutput {
+			return "incomplete"
+		}
+		return "failed"
+	}
+	switch c.finishReason {
+	case "length", "content_filter":
+		return "incomplete"
+	default:
+		return "completed"
+	}
 }
 
 func (c *StreamingConverter) processChunk(data map[string]any) []string {
@@ -1314,23 +1884,22 @@ func (c *StreamingConverter) processChunk(data map[string]any) []string {
 
 	// reasoning_content (DeepSeek, Kimi, GLM)
 	if rc := stringValue(delta["reasoning_content"]); rc != "" {
-		c.reasoningText += rc
-		events = append(events, c.ensureReasoningDelta()...)
+		events = append(events, c.appendReasoningDelta(rc)...)
+	}
+
+	if reasoningDelta := extractReasoningDelta(delta["reasoning"]); reasoningDelta != "" {
+		events = append(events, c.appendReasoningDelta(reasoningDelta)...)
 	}
 
 	// visible content delta
 	if content := stringValue(delta["content"]); content != "" {
-		if thinkR, visible := splitThinkTag(content); thinkR != "" {
-			c.reasoningText += thinkR
-			content = visible
-			events = append(events, c.ensureReasoningDelta()...)
+		reasoning, visible := c.contentThink.consume(content)
+		if reasoning != "" {
+			events = append(events, c.appendReasoningDelta(reasoning)...)
 		}
-		events = append(events, c.ensureContentPart()...)
-		c.fullText += content
-		events = append(events, sseEvent("response.output_text.delta", map[string]any{
-			"item_id": c.messageID, "output_index": c.messageOutputIndexValue(),
-			"content_index": 0, "delta": content,
-		}))
+		if visible != "" {
+			events = append(events, c.appendVisibleDelta(visible)...)
+		}
 	}
 
 	// reasoning_details delta (MiniMax)
@@ -1338,8 +1907,7 @@ func (c *StreamingConverter) processChunk(data map[string]any) []string {
 		for _, d := range details {
 			if dm, ok := d.(map[string]any); ok {
 				if text := stringValue(dm["text"]); text != "" {
-					c.reasoningText += text
-					events = append(events, c.ensureReasoningDelta()...)
+					events = append(events, c.appendReasoningDelta(text)...)
 				}
 			}
 		}
@@ -1352,15 +1920,16 @@ func (c *StreamingConverter) processChunk(data map[string]any) []string {
 			if !ok {
 				continue
 			}
+			c.sawSubstantiveOutput = true
 			events = append(events, c.processToolCallDelta(tc)...)
 		}
 	}
 
+	if finishReason != "" {
+		c.finishReason = finishReason
+	}
 	if finishReason != "" && !c.outputItemDone {
-		status := "completed"
-		if finishReason == "length" || finishReason == "content_filter" {
-			status = "incomplete"
-		}
+		status := c.finalStatus()
 		events = append(events, c.finishOutputItems()...)
 		events = append(events, c.finishResponse(status)...)
 	}
@@ -1368,31 +1937,86 @@ func (c *StreamingConverter) processChunk(data map[string]any) []string {
 	return events
 }
 
-func (c *StreamingConverter) ensureReasoningDelta() []string {
-	if c.reasoningDone || c.reasoningText == "" {
+func extractReasoningDelta(value any) string {
+	parts := messageTextParts{}
+	parts.collectReasoning(value)
+	return strings.Join(parts.reasoningParts, "")
+}
+
+func (c *StreamingConverter) appendReasoningDelta(delta string) []string {
+	if delta == "" {
+		return nil
+	}
+	c.reasoningText += delta
+	c.sawSubstantiveOutput = true
+	events := c.ensureReasoningItem()
+	events = append(events, sseEvent("response.reasoning_summary_text.delta", map[string]any{
+		"item_id": c.reasoningItemID(), "output_index": c.reasoningOutputIndexValue(),
+		"summary_index": 0, "delta": delta,
+	}))
+	return events
+}
+
+func (c *StreamingConverter) appendVisibleDelta(delta string) []string {
+	if delta == "" {
+		return nil
+	}
+	c.fullText += delta
+	c.sawSubstantiveOutput = true
+	events := c.ensureContentPart()
+	events = append(events, sseEvent("response.output_text.delta", map[string]any{
+		"item_id": c.messageID, "output_index": c.messageOutputIndexValue(),
+		"content_index": 0, "delta": delta,
+	}))
+	return events
+}
+
+func (c *StreamingConverter) flushThinkContent() []string {
+	reasoning, visible := c.contentThink.finish()
+	var events []string
+	if reasoning != "" {
+		events = append(events, c.appendReasoningDelta(reasoning)...)
+	}
+	if visible != "" {
+		events = append(events, c.appendVisibleDelta(visible)...)
+	}
+	return events
+}
+
+func (c *StreamingConverter) ensureReasoningItem() []string {
+	if c.reasoningDone {
 		return nil
 	}
 	c.reasoningDone = true
-	outputIndex := c.allocateOutputIndex()
-	itemID := "rs_" + strings.TrimPrefix(c.responseID, "resp_")
-	if itemID == "rs_" {
-		itemID = "rs_unknown"
-	}
+	outputIndex := c.reasoningOutputIndexValue()
 	return []string{
 		sseEvent("response.output_item.added", map[string]any{
 			"output_index": outputIndex,
 			"item": map[string]any{
 				"type":    "reasoning",
-				"id":      itemID,
+				"id":      c.reasoningItemID(),
 				"status":  "in_progress",
 				"summary": []any{},
 			},
 		}),
-		sseEvent("response.reasoning_text.delta", map[string]any{
-			"item_id": itemID, "output_index": outputIndex,
-			"content_index": 0, "delta": c.reasoningText,
+		sseEvent("response.reasoning_summary_part.added", map[string]any{
+			"item_id": c.reasoningItemID(), "output_index": outputIndex,
+			"summary_index": 0,
+			"part":          map[string]any{"type": "summary_text", "text": ""},
 		}),
 	}
+}
+
+func (c *StreamingConverter) ensureReasoningDelta() []string {
+	if c.reasoningText == "" {
+		return nil
+	}
+	events := c.ensureReasoningItem()
+	events = append(events, sseEvent("response.reasoning_summary_text.delta", map[string]any{
+		"item_id": c.reasoningItemID(), "output_index": c.reasoningOutputIndexValue(),
+		"summary_index": 0, "delta": c.reasoningText,
+	}))
+	return events
 }
 
 func (c *StreamingConverter) ensureInitialized(data map[string]any) []string {
@@ -1471,124 +2095,58 @@ func (c *StreamingConverter) processToolCallDelta(toolCall map[string]any) []str
 	if name := stringValue(function["name"]); name != "" {
 		entry.Name = name
 	}
-	if entry.ItemID == "" {
-		entry.ItemID = c.toolItemID(entry.ID, index)
-	}
 	if entry.OutputIndex == nil {
 		outputIndex := c.allocateOutputIndex()
 		entry.OutputIndex = &outputIndex
 	}
+	entry.spec = normalizeStreamToolCall(entry.Name, entry.Arguments)
+	if entry.spec.kind != streamToolCallKindUnknown && entry.ItemID == "" {
+		entry.ItemID = c.toolItemIDForSpec(entry.spec, entry.ID, index)
+	}
 
 	var events []string
-	if !entry.Added {
+	if !entry.Added && entry.spec.kind != streamToolCallKindUnknown {
 		entry.Added = true
 		events = append(events, sseEvent("response.output_item.added", map[string]any{
 			"output_index": *entry.OutputIndex,
-			"item": map[string]any{
-				"type": "function_call", "id": entry.ItemID, "call_id": entry.ID,
-				"status": "in_progress", "name": entry.Name, "arguments": "",
-			},
+			"item":         renderStreamToolCallItem(entry.spec, entry.ItemID, entry.ID, "", "in_progress"),
 		}))
 	}
 	if arguments := stringValue(function["arguments"]); arguments != "" {
 		entry.Arguments += arguments
-		events = append(events, sseEvent("response.function_call_arguments.delta", map[string]any{
-			"item_id": entry.ItemID, "output_index": *entry.OutputIndex,
-			"delta": arguments,
-		}))
+		entry.spec = normalizeStreamToolCall(entry.Name, entry.Arguments)
+		if entry.spec.kind != streamToolCallKindUnknown {
+			if entry.ItemID == "" {
+				entry.ItemID = c.toolItemIDForSpec(entry.spec, entry.ID, index)
+			}
+			if !entry.Added {
+				entry.Added = true
+				events = append(events, sseEvent("response.output_item.added", map[string]any{
+					"output_index": *entry.OutputIndex,
+					"item":         renderStreamToolCallItem(entry.spec, entry.ItemID, entry.ID, "", "in_progress"),
+				}))
+			}
+			events = append(events, sseEvent("response.function_call_arguments.delta", map[string]any{
+				"item_id": entry.ItemID, "output_index": *entry.OutputIndex,
+				"delta": arguments,
+			}))
+		}
 	}
 	return events
 }
 
 func (c *StreamingConverter) finishOutputItems() []string {
-	var events []string
-	if !c.outputItemDone {
-		c.outputItemDone = true
-		events = append(events, c.finishReasoningEvents()...)
-		events = append(events, c.finishTextEvents()...)
-		if c.outputItemAdded {
-			var content []any
-			if c.contentPartAdded {
-				content = append(content, map[string]any{
-					"type": "output_text", "text": c.fullText, "annotations": []any{},
-				})
-			}
-			events = append(events, sseEvent("response.output_item.done", map[string]any{
-				"output_index": c.messageOutputIndexValue(),
-				"item": map[string]any{
-					"type": "message", "id": c.messageID, "status": "completed",
-					"role": c.messageRole, "content": content,
-				},
-			}))
-		}
-	}
-	events = append(events, c.finishToolEvents()...)
-	return events
-}
-
-func (c *StreamingConverter) finishReasoningEvents() []string {
-	if !c.reasoningDone || c.reasoningText == "" {
+	if c.outputItemDone {
 		return nil
 	}
-	itemID := "rs_" + strings.TrimPrefix(c.responseID, "resp_")
-	return []string{
-		sseEvent("response.reasoning_text.done", map[string]any{
-			"item_id": itemID, "output_index": 0, "content_index": 0,
-			"text": c.reasoningText,
-		}),
-		sseEvent("response.output_item.done", map[string]any{
-			"output_index": 0,
-			"item": map[string]any{
-				"type": "reasoning", "id": itemID, "status": "completed",
-				"summary": []any{
-					map[string]any{"type": "summary_text", "text": c.reasoningText},
-				},
-			},
-		}),
-	}
-}
+	c.outputItemDone = true
 
-func (c *StreamingConverter) finishTextEvents() []string {
-	if !c.contentPartAdded || c.textDone {
-		return nil
-	}
-	c.textDone = true
-	return []string{
-		sseEvent("response.output_text.done", map[string]any{
-			"item_id": c.messageID, "output_index": c.messageOutputIndexValue(),
-			"content_index": 0, "text": c.fullText,
-		}),
-		sseEvent("response.content_part.done", map[string]any{
-			"item_id": c.messageID, "output_index": c.messageOutputIndexValue(),
-			"content_index": 0,
-			"part": map[string]any{
-				"type": "output_text", "text": c.fullText, "annotations": []any{},
-			},
-		}),
-	}
-}
-
-func (c *StreamingConverter) finishToolEvents() []string {
-	var events []string
-	indexes := sortedToolIndexes(c.toolCalls)
-	for _, index := range indexes {
-		tc := c.toolCalls[index]
-		if !tc.Added || tc.OutputIndex == nil {
-			continue
+	events := c.flushThinkContent()
+	for _, item := range c.orderedFinalOutputItems() {
+		if item.addedEvent != "" {
+			events = append(events, item.addedEvent)
 		}
-		events = append(events,
-			sseEvent("response.function_call_arguments.done", map[string]any{
-				"item_id": tc.ItemID, "output_index": *tc.OutputIndex,
-				"arguments": tc.Arguments,
-			}),
-			sseEvent("response.output_item.done", map[string]any{
-				"output_index": *tc.OutputIndex,
-				"item": map[string]any{
-					"type": "function_call", "id": tc.ItemID, "call_id": tc.ID,
-					"status": "completed", "name": tc.Name, "arguments": tc.Arguments,
-				},
-			}),
-		)
+		events = append(events, item.doneEvents...)
 	}
 	return events
 }
@@ -1607,34 +2165,129 @@ func (c *StreamingConverter) finishResponse(status string) []string {
 	})}
 }
 
+func (c *StreamingConverter) doneSentinel() []string {
+	if c.doneSent {
+		return nil
+	}
+	c.doneSent = true
+	return []string{"data: [DONE]\n\n"}
+}
+
 func (c *StreamingConverter) buildOutput() []any {
-	var output []any
+	items := c.orderedFinalOutputItems()
+	output := make([]any, 0, len(items))
+	for _, item := range items {
+		output = append(output, item.output)
+	}
+	return output
+}
+
+func (c *StreamingConverter) orderedFinalOutputItems() []finalStreamingOutputItem {
+	items := make([]finalStreamingOutputItem, 0, 1+len(c.toolCalls))
+
 	if c.reasoningText != "" {
-		itemID := "rs_" + strings.TrimPrefix(c.responseID, "resp_")
-		output = append(output, map[string]any{
-			"type": "reasoning", "id": itemID, "status": "completed",
-			"summary": []any{
-				map[string]any{"type": "summary_text", "text": c.reasoningText},
+		outputIndex := c.reasoningOutputIndexValue()
+		items = append(items, finalStreamingOutputItem{
+			outputIndex: outputIndex,
+			output: map[string]any{
+				"type": "reasoning", "id": c.reasoningItemID(), "status": "completed",
+				"summary": []any{
+					map[string]any{"type": "summary_text", "text": c.reasoningText},
+				},
+			},
+			doneEvents: []string{
+				sseEvent("response.reasoning_summary_text.done", map[string]any{
+					"item_id": c.reasoningItemID(), "output_index": outputIndex, "summary_index": 0,
+					"text": c.reasoningText,
+				}),
+				sseEvent("response.output_item.done", map[string]any{
+					"output_index": outputIndex,
+					"item": map[string]any{
+						"type": "reasoning", "id": c.reasoningItemID(), "status": "completed",
+						"summary": []any{
+							map[string]any{"type": "summary_text", "text": c.reasoningText},
+						},
+					},
+				}),
 			},
 		})
 	}
+
 	if c.contentPartAdded {
-		output = append(output, map[string]any{
-			"type": "message", "id": c.messageID, "status": "completed",
-			"role":    c.messageRole,
-			"content": []any{map[string]any{"type": "output_text", "text": c.fullText, "annotations": []any{}}},
+		outputIndex := c.messageOutputIndexValue()
+		items = append(items, finalStreamingOutputItem{
+			outputIndex: outputIndex,
+			output: map[string]any{
+				"type": "message", "id": c.messageID, "status": "completed",
+				"role":    c.messageRole,
+				"content": []any{map[string]any{"type": "output_text", "text": c.fullText, "annotations": []any{}}},
+			},
+			doneEvents: []string{
+				sseEvent("response.output_text.done", map[string]any{
+					"item_id": c.messageID, "output_index": outputIndex,
+					"content_index": 0, "text": c.fullText,
+				}),
+				sseEvent("response.content_part.done", map[string]any{
+					"item_id": c.messageID, "output_index": outputIndex,
+					"content_index": 0,
+					"part": map[string]any{
+						"type": "output_text", "text": c.fullText, "annotations": []any{},
+					},
+				}),
+				sseEvent("response.output_item.done", map[string]any{
+					"output_index": outputIndex,
+					"item": map[string]any{
+						"type": "message", "id": c.messageID, "status": "completed",
+						"role": c.messageRole, "content": []any{map[string]any{"type": "output_text", "text": c.fullText, "annotations": []any{}}},
+					},
+				}),
+			},
 		})
 	}
+
 	for _, index := range sortedToolIndexes(c.toolCalls) {
 		tc := c.toolCalls[index]
-		if tc.Added {
-			output = append(output, map[string]any{
-				"type": "function_call", "id": tc.ItemID, "call_id": tc.ID,
-				"status": "completed", "name": tc.Name, "arguments": tc.Arguments,
+		if tc.OutputIndex == nil {
+			continue
+		}
+		tc.spec = normalizeStreamToolCall(tc.Name, tc.Arguments)
+		if tc.spec.kind == streamToolCallKindUnknown {
+			tc.spec = streamToolCallSpecFromArguments(tc.Name, tc.Arguments)
+		}
+		if tc.ItemID == "" {
+			tc.ItemID = c.toolItemIDForSpec(tc.spec, tc.ID, index)
+		}
+		outputIndex := *tc.OutputIndex
+		item := renderStreamToolCallItem(tc.spec, tc.ItemID, tc.ID, tc.Arguments, "completed")
+		addedEvent := ""
+		if !tc.Added {
+			tc.Added = true
+			addedEvent = sseEvent("response.output_item.added", map[string]any{
+				"output_index": outputIndex,
+				"item":         renderStreamToolCallItem(tc.spec, tc.ItemID, tc.ID, tc.Arguments, "in_progress"),
 			})
 		}
+		items = append(items, finalStreamingOutputItem{
+			outputIndex: outputIndex,
+			addedEvent:  addedEvent,
+			output:      item,
+			doneEvents: []string{
+				sseEvent("response.function_call_arguments.done", map[string]any{
+					"item_id": tc.ItemID, "output_index": outputIndex,
+					"arguments": tc.Arguments,
+				}),
+				sseEvent("response.output_item.done", map[string]any{
+					"output_index": outputIndex,
+					"item":         item,
+				}),
+			},
+		})
 	}
-	return output
+
+	sort.SliceStable(items, func(i, j int) bool {
+		return items[i].outputIndex < items[j].outputIndex
+	})
+	return items
 }
 
 func (c *StreamingConverter) buildUsage() map[string]any {
@@ -1659,16 +2312,136 @@ func (c *StreamingConverter) messageOutputIndexValue() int {
 	return *c.messageOutputIndex
 }
 
-func (c *StreamingConverter) toolItemID(callID string, index int) string {
+func (c *StreamingConverter) reasoningOutputIndexValue() int {
+	if c.reasoningOutputIndex == nil {
+		idx := c.allocateOutputIndex()
+		c.reasoningOutputIndex = &idx
+	}
+	return *c.reasoningOutputIndex
+}
+
+func (c *StreamingConverter) reasoningItemID() string {
+	suffix := responseSuffix(c.responseID)
+	return "rs_" + suffix
+}
+
+func responseSuffix(responseID string) string {
+	suffix := strings.TrimPrefix(responseID, "resp-")
+	suffix = strings.TrimPrefix(suffix, "resp_")
+	if suffix == "" {
+		return "unknown"
+	}
+	return suffix
+}
+
+func toolCallFallbackID(prefix, suffix string, index int) string {
+	if suffix == "" {
+		suffix = "unknown"
+	}
+	return fmt.Sprintf("%s%s_%d", prefix, suffix, index)
+}
+
+func (c *StreamingConverter) toolItemIDForSpec(spec normalizedStreamToolCall, callID string, index int) string {
+	prefix := "fc_"
+	switch spec.kind {
+	case streamToolCallKindCustom:
+		prefix = "ctc_"
+	case streamToolCallKindToolSearch:
+		prefix = "tsc_"
+	}
 	if callID != "" {
-		return "fc_" + strings.TrimPrefix(callID, "call_")
+		return prefix + strings.TrimPrefix(callID, "call_")
 	}
 	suffix := strings.TrimPrefix(c.responseID, "resp-")
 	suffix = strings.TrimPrefix(suffix, "resp_")
 	if suffix == "" {
 		suffix = "unknown"
 	}
-	return fmt.Sprintf("fc_%s_%d", suffix, index)
+	return fmt.Sprintf("%s%s_%d", prefix, suffix, index)
+}
+
+func normalizeStreamToolCall(name, arguments string) normalizedStreamToolCall {
+	spec := normalizedStreamToolCall{name: name}
+	switch {
+	case name == "":
+		return spec
+	case name == toolSearchProxyName:
+		spec.kind = streamToolCallKindToolSearch
+		spec.execution = "client"
+		return spec
+	case strings.Contains(name, "__"):
+		namespace, child, found := strings.Cut(name, "__")
+		if found && namespace != "" && child != "" {
+			spec.kind = streamToolCallKindNamespace
+			spec.namespace = namespace
+			spec.name = child
+			return spec
+		}
+	}
+
+	obj := parseJSONObject(arguments)
+	if obj == nil {
+		return spec
+	}
+	if len(obj) == 1 {
+		if input, ok := obj[customToolInputField]; ok {
+			spec.kind = streamToolCallKindCustom
+			spec.input = stringValue(input)
+			return spec
+		}
+	}
+	spec.kind = streamToolCallKindFunction
+	return spec
+}
+
+func streamToolCallSpecFromArguments(name, arguments string) normalizedStreamToolCall {
+	return normalizeStreamToolCall(name, arguments)
+}
+
+func renderStreamToolCallItem(spec normalizedStreamToolCall, itemID, callID, arguments, status string) map[string]any {
+	switch spec.kind {
+	case streamToolCallKindNamespace:
+		return map[string]any{
+			"type":      "function_call",
+			"id":        itemID,
+			"call_id":   callID,
+			"status":    status,
+			"namespace": spec.namespace,
+			"name":      spec.name,
+			"arguments": arguments,
+		}
+	case streamToolCallKindCustom:
+		input := spec.input
+		if input == "" {
+			input = extractCustomToolInput(arguments)
+		}
+		return map[string]any{
+			"type":    "custom_tool_call",
+			"id":      itemID,
+			"call_id": callID,
+			"status":  status,
+			"name":    spec.name,
+			"input":   input,
+		}
+	case streamToolCallKindToolSearch:
+		return map[string]any{
+			"type":      "tool_search_call",
+			"id":        itemID,
+			"call_id":   callID,
+			"status":    status,
+			"arguments": parseJSONObject(arguments),
+			"execution": valueOrDefault(spec.execution, "client"),
+		}
+	default:
+		return map[string]any{
+			"type":      "function_call",
+			"id":        itemID,
+			"call_id":   callID,
+			"status":    status,
+			"name":      spec.name,
+			"arguments": arguments,
+		}
+	}
 }
 
 func buildResponseStub(responseID string, created int, status, model string) map[string]any {

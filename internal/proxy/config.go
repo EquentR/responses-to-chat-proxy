@@ -11,8 +11,14 @@ import (
 
 type Config struct {
 	UpstreamBaseURL       string
+	UpstreamModelsURL     string
 	UpstreamAPIKey        string
 	ReasoningMode         ReasoningMode // reasoning parameter mapping mode
+	RouteDetection        RouteDetectionMode
+	RouteTableTTLSeconds  float64
+	RouteTableTTL         time.Duration
+	RouteTablePersist     bool
+	RouteProbeGeneration  bool
 	ProxyAPIKey           string
 	ModelOverride         string
 	Host                  string
@@ -33,6 +39,7 @@ func LoadConfigFromEnv(dotEnvPath string) (Config, error) {
 
 	cfg := Config{
 		UpstreamBaseURL:       envString("UPSTREAM_BASE_URL", "https://api.openai.com/v1"),
+		UpstreamModelsURL:     envString("UPSTREAM_MODELS_URL", ""),
 		UpstreamAPIKey:        envString("UPSTREAM_API_KEY", ""),
 		ProxyAPIKey:           envString("PROXY_API_KEY", ""),
 		ModelOverride:         envString("MODEL_OVERRIDE", ""),
@@ -45,12 +52,18 @@ func LoadConfigFromEnv(dotEnvPath string) (Config, error) {
 		// ReasoningMode overrides model-name inference of the reasoning parameter
 		// form sent upstream. Empty falls back to model/base-URL inference. Allowed:
 		// effort, effort_obj, thinking, thinking_only, enable_thinking, reasoning_split.
-		ReasoningMode: ReasoningMode(envString("REASONING_MODE", "")),
+		ReasoningMode:        ReasoningMode(envString("REASONING_MODE", "")),
+		RouteDetection:       parseRouteDetectionMode(envString("ROUTE_DETECTION", string(RouteDetectionLazy))),
+		RouteTableTTLSeconds: envFloat("ROUTE_TABLE_TTL_SECONDS", defaultRouteTableTTLSeconds),
+		RouteTablePersist:    envBool("ROUTE_TABLE_PERSIST", false),
+		RouteProbeGeneration: envBool("ROUTE_PROBE_GENERATION", defaultRouteProbeGeneration),
 	}
 
-	cfg.UpstreamBaseURL = strings.TrimRight(cfg.UpstreamBaseURL, "/")
+	cfg.UpstreamBaseURL = normalizeUpstreamBaseURL(cfg.UpstreamBaseURL)
 	cfg.RequestTimeout = secondsToDuration(cfg.RequestTimeoutSeconds)
 	cfg.StreamTimeout = secondsToDuration(cfg.StreamTimeoutSeconds)
+	cfg.RouteTableTTLSeconds = normalizeRouteTableTTLSeconds(cfg.RouteTableTTLSeconds)
+	cfg.RouteTableTTL = secondsToDuration(cfg.RouteTableTTLSeconds)
 
 	if cfg.UpstreamBaseURL == "" {
 		return Config{}, errors.New("UPSTREAM_BASE_URL must not be empty")
@@ -148,4 +161,11 @@ func envBool(key string, fallback bool) bool {
 
 func secondsToDuration(seconds float64) time.Duration {
 	return time.Duration(seconds * float64(time.Second))
+}
+
+func normalizeRouteTableTTLSeconds(seconds float64) float64 {
+	if seconds <= 0 {
+		return defaultRouteTableTTLSeconds
+	}
+	return seconds
 }

@@ -2,11 +2,279 @@ package proxy
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 )
+
+type flushRecorder struct {
+	*httptest.ResponseRecorder
+	flushes int
+}
+
+func (r *flushRecorder) Flush() {
+	r.flushes++
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+type sequentialReadCloser struct {
+	chunks [][]byte
+	index  int
+}
+
+func (r *sequentialReadCloser) Read(p []byte) (int, error) {
+	if r.index >= len(r.chunks) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.chunks[r.index])
+	r.index++
+	return n, nil
+}
+
+func (r *sequentialReadCloser) Close() error {
+	return nil
+}
+
+func newRouteAwareTestServer(upstreamBaseURL, upstreamAPIKey string) *Server {
+	return NewServer(Config{
+		UpstreamBaseURL: upstreamBaseURL,
+		UpstreamAPIKey:  upstreamAPIKey,
+		RequestTimeout:  secondsToDuration(5),
+		StreamTimeout:   secondsToDuration(5),
+		VerifySSL:       true,
+	})
+}
+
+func storeTestRoute(server *Server, model string, protocol RouteProtocol, endpoint string) {
+	server.routeTable.Store(RouteIdentityKey(server.config.UpstreamBaseURL, server.config.UpstreamAPIKey), model, RouteEntry{
+		ModelID:    model,
+		Protocol:   protocol,
+		Endpoint:   endpoint,
+		Confidence: RouteConfidenceExplicit,
+	})
+}
+
+func TestPassthroughStreamRoutesRawResponsesSSEAndFlushesChunks(t *testing.T) {
+	server := newRouteAwareTestServer("https://upstream.example/v1", "upstream-secret")
+	storeTestRoute(server, "responses-model", RouteProtocolResponses, "/v1/responses")
+	server.streamClient = &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path != "/v1/responses" {
+			t.Fatalf("unexpected path: %s", req.URL.Path)
+		}
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			t.Fatalf("ReadAll request body returned error: %v", err)
+		}
+		if !strings.Contains(string(body), `"stream":true`) {
+			t.Fatalf("expected stream request body, got %s", body)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body: &sequentialReadCloser{
+				chunks: [][]byte{
+					[]byte("data: {\"type\":\"response.created\"}\n\n"),
+					[]byte("data: [DONE]\n\n"),
+				},
+			},
+		}, nil
+	})}
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"responses-model","input":"hello","stream":true}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
+
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if got := recorder.Header().Get("Content-Type"); got != "text/event-stream; charset=utf-8" {
+		t.Fatalf("unexpected content type: %s body=%s", got, recorder.Body.String())
+	}
+	if recorder.flushes != 2 {
+		t.Fatalf("expected per-chunk flushes, got %d body=%s", recorder.flushes, recorder.Body.String())
+	}
+	assertContains(t, recorder.Body.String(), "data: {\"type\":\"response.created\"}")
+	assertContains(t, recorder.Body.String(), "data: [DONE]")
+}
+
+func TestPassthroughStreamRoutesMessagesSSEAndHandlesUpstream4xx(t *testing.T) {
+	t.Run("raw stream passes through", func(t *testing.T) {
+		server := newRouteAwareTestServer("https://upstream.example/v1", "upstream-secret")
+		storeTestRoute(server, "messages-model", RouteProtocolMessages, "/v1/messages")
+		server.streamClient = &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			if req.URL.Path != "/v1/messages" {
+				t.Fatalf("unexpected path: %s", req.URL.Path)
+			}
+			body, err := io.ReadAll(req.Body)
+			if err != nil {
+				t.Fatalf("ReadAll request body returned error: %v", err)
+			}
+			if !strings.Contains(string(body), `"stream":true`) {
+				t.Fatalf("expected stream request body, got %s", body)
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body: &sequentialReadCloser{
+					chunks: [][]byte{
+						[]byte("data: {\"type\":\"message.delta\"}\n\n"),
+					},
+				},
+			}, nil
+		})}
+
+		request := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"messages-model","messages":[{"role":"user","content":"hi"}],"stream":true}`))
+		request.Header.Set("Content-Type", "application/json")
+		recorder := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
+
+		server.ServeHTTP(recorder, request)
+
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+		}
+		if got := recorder.Header().Get("Content-Type"); got != "text/event-stream; charset=utf-8" {
+			t.Fatalf("unexpected content type: %s body=%s", got, recorder.Body.String())
+		}
+		if recorder.flushes != 1 {
+			t.Fatalf("expected stream flushes, got %d body=%s", recorder.flushes, recorder.Body.String())
+		}
+		assertContains(t, recorder.Body.String(), "data: {\"type\":\"message.delta\"}")
+	})
+
+	t.Run("upstream 4xx becomes local sse error", func(t *testing.T) {
+		server := newRouteAwareTestServer("https://upstream.example/v1", "upstream-secret")
+		storeTestRoute(server, "messages-model", RouteProtocolMessages, "/v1/messages")
+		server.streamClient = &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			if req.URL.Path != "/v1/messages" {
+				t.Fatalf("unexpected path: %s", req.URL.Path)
+			}
+			body, err := io.ReadAll(req.Body)
+			if err != nil {
+				t.Fatalf("ReadAll request body returned error: %v", err)
+			}
+			if !strings.Contains(string(body), `"stream":true`) {
+				t.Fatalf("expected stream request body, got %s", body)
+			}
+			return &http.Response{
+				StatusCode: http.StatusBadRequest,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"nope"}}`)),
+			}, nil
+		})}
+
+		request := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"messages-model","messages":[{"role":"user","content":"hi"}],"stream":true}`))
+		request.Header.Set("Content-Type", "application/json")
+		recorder := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
+
+		server.ServeHTTP(recorder, request)
+
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+		}
+		if got := recorder.Header().Get("Content-Type"); got != "text/event-stream; charset=utf-8" {
+			t.Fatalf("unexpected content type: %s body=%s", got, recorder.Body.String())
+		}
+		assertContains(t, recorder.Body.String(), "event: error")
+		assertContains(t, recorder.Body.String(), "\"message\":\"nope\"")
+		assertContains(t, recorder.Body.String(), "\"code\":\"http_400\"")
+	})
+}
+
+func TestJoinUpstreamEndpoint(t *testing.T) {
+	tests := []struct {
+		name     string
+		baseURL  string
+		endpoint string
+		want     string
+	}{
+		{
+			name:     "base with version endpoint with version",
+			baseURL:  "https://upstream.example/v1",
+			endpoint: "/v1/responses",
+			want:     "https://upstream.example/v1/responses",
+		},
+		{
+			name:     "base without version endpoint with version",
+			baseURL:  "https://upstream.example",
+			endpoint: "/v1/responses",
+			want:     "https://upstream.example/v1/responses",
+		},
+		{
+			name:     "base without version endpoint without version",
+			baseURL:  "https://upstream.example",
+			endpoint: "/messages",
+			want:     "https://upstream.example/messages",
+		},
+		{
+			name:     "endpoint without leading slash",
+			baseURL:  "https://upstream.example/v1",
+			endpoint: "responses",
+			want:     "https://upstream.example/v1/responses",
+		},
+		{
+			name:     "endpoint with whitespace",
+			baseURL:  " https://upstream.example/v1/ ",
+			endpoint: "  /v1/messages  ",
+			want:     "https://upstream.example/v1/messages",
+		},
+		{
+			name:     "absolute endpoint",
+			baseURL:  "https://upstream.example/v1",
+			endpoint: "https://alt.example/v1/messages",
+			want:     "https://alt.example/v1/messages",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := joinUpstreamEndpoint(tt.baseURL, tt.endpoint); got != tt.want {
+				t.Fatalf("unexpected endpoint: got %q want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func assertJSONTextEqual(t *testing.T, wantRaw, gotRaw string) {
+	t.Helper()
+
+	var want any
+	if err := json.Unmarshal([]byte(wantRaw), &want); err != nil {
+		t.Fatalf("json.Unmarshal want returned error: %v", err)
+	}
+	var got any
+	if err := json.Unmarshal([]byte(gotRaw), &got); err != nil {
+		t.Fatalf("json.Unmarshal got returned error: %v", err)
+	}
+	if !reflect.DeepEqual(want, got) {
+		t.Fatalf("unexpected JSON\nwant: %s\ngot:  %s", wantRaw, gotRaw)
+	}
+}
+
+func assertErrorTypeAndCode(t *testing.T, raw []byte, wantType, wantCode string) {
+	t.Helper()
+
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("json.Unmarshal error payload returned error: %v body=%s", err, raw)
+	}
+	errorBody, ok := payload["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected OpenAI-style error body, got %#v", payload)
+	}
+	if errorBody["type"] != wantType || errorBody["code"] != wantCode {
+		t.Fatalf("unexpected error body: %#v", errorBody)
+	}
+}
 
 func TestHealthEndpoint(t *testing.T) {
 	server := NewServer(Config{})
@@ -69,6 +337,516 @@ func TestResponsesEndpointConvertsUpstreamResponse(t *testing.T) {
 	}
 	if payload["id"] != "resp-abc" {
 		t.Fatalf("unexpected response id: %v", payload["id"])
+	}
+}
+
+func TestResponsesPassesThroughResponsesUpstream(t *testing.T) {
+	var upstreamPath string
+	var upstreamBody map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamPath = r.URL.Path
+		if err := json.NewDecoder(r.Body).Decode(&upstreamBody); err != nil {
+			t.Fatalf("Decode upstream body returned error: %v", err)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":     "resp-upstream",
+			"object": "response",
+			"model":  "responses-model",
+			"output": []any{},
+		})
+	}))
+	defer upstream.Close()
+
+	server := newRouteAwareTestServer(upstream.URL+"/v1", "upstream-secret")
+	storeTestRoute(server, "responses-model", RouteProtocolResponses, "/v1/responses")
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"responses-model","input":"hello","metadata":{"keep":true}}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if upstreamPath != "/v1/responses" {
+		t.Fatalf("unexpected upstream path: %s", upstreamPath)
+	}
+	if upstreamBody["input"] != "hello" {
+		t.Fatalf("expected responses body to pass through unchanged, got %#v", upstreamBody)
+	}
+	if _, ok := upstreamBody["messages"]; ok {
+		t.Fatalf("expected responses passthrough not to include chat messages, got %#v", upstreamBody)
+	}
+}
+
+func TestResponsesRoutesToChatWhenChatOnly(t *testing.T) {
+	var upstreamPath string
+	var upstreamBody map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamPath = r.URL.Path
+		if err := json.NewDecoder(r.Body).Decode(&upstreamBody); err != nil {
+			t.Fatalf("Decode upstream body returned error: %v", err)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":      "chatcmpl-route",
+			"created": 123,
+			"model":   "chat-model",
+			"choices": []any{
+				map[string]any{
+					"finish_reason": "stop",
+					"message":       map[string]any{"role": "assistant", "content": "Hi"},
+				},
+			},
+		})
+	}))
+	defer upstream.Close()
+
+	server := newRouteAwareTestServer(upstream.URL+"/v1", "upstream-secret")
+	storeTestRoute(server, "chat-model", RouteProtocolChat, "/v1/chat/completions")
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"chat-model","input":"hello"}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if upstreamPath != "/v1/chat/completions" {
+		t.Fatalf("unexpected upstream path: %s", upstreamPath)
+	}
+	if _, ok := upstreamBody["messages"]; !ok {
+		t.Fatalf("expected responses request to convert to chat messages, got %#v", upstreamBody)
+	}
+	if _, ok := upstreamBody["input"]; ok {
+		t.Fatalf("expected converted chat body not to include responses input, got %#v", upstreamBody)
+	}
+}
+
+func TestMessagesOnlyUpstreamCanServeResponsesRequests(t *testing.T) {
+	var upstreamPath string
+	var upstreamBody map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamPath = r.URL.Path
+		if err := json.NewDecoder(r.Body).Decode(&upstreamBody); err != nil {
+			t.Fatalf("Decode upstream body returned error: %v", err)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":   "msg-abc",
+			"type": "message",
+			"role": "assistant",
+			"content": []any{
+				map[string]any{"type": "text", "text": "Hi"},
+			},
+			"usage": map[string]any{
+				"input_tokens":  4,
+				"output_tokens": 2,
+				"total_tokens":  6,
+			},
+		})
+	}))
+	defer upstream.Close()
+
+	server := newRouteAwareTestServer(upstream.URL+"/v1", "upstream-secret")
+	storeTestRoute(server, "messages-model", RouteProtocolMessages, "/v1/messages")
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"messages-model","instructions":"Be brief.","input":"hello","max_output_tokens":20}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if upstreamPath != "/v1/messages" {
+		t.Fatalf("unexpected upstream path: %s", upstreamPath)
+	}
+	if upstreamBody["system"] != "Be brief." {
+		t.Fatalf("expected instructions to map to system, got %#v", upstreamBody["system"])
+	}
+	if upstreamBody["max_tokens"] != float64(20) {
+		t.Fatalf("expected max_output_tokens to map to max_tokens, got %#v", upstreamBody["max_tokens"])
+	}
+	messages, _ := upstreamBody["messages"].([]any)
+	if len(messages) != 1 {
+		t.Fatalf("expected one user message, got %#v", upstreamBody["messages"])
+	}
+	userMsg, _ := messages[0].(map[string]any)
+	if userMsg["role"] != "user" {
+		t.Fatalf("expected user role, got %#v", userMsg)
+	}
+	content, _ := userMsg["content"].([]any)
+	if len(content) != 1 || content[0].(map[string]any)["type"] != "text" {
+		t.Fatalf("expected text content block, got %#v", userMsg["content"])
+	}
+	if payload := recorder.Body.String(); !strings.Contains(payload, `"id":"resp-abc"`) {
+		t.Fatalf("expected converted responses payload, got %s", payload)
+	}
+}
+
+func TestMessagesOnlyUpstreamUsesRouteFeaturesForThinkingAndDowngrade(t *testing.T) {
+	var upstreamBody map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&upstreamBody); err != nil {
+			t.Fatalf("Decode upstream body returned error: %v", err)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":   "msg-route",
+			"type": "message",
+			"role": "assistant",
+			"content": []any{
+				map[string]any{"type": "text", "text": "Hi"},
+			},
+		})
+	}))
+	defer upstream.Close()
+
+	server := newRouteAwareTestServer(upstream.URL+"/v1", "upstream-secret")
+	identity := RouteIdentityKey(server.config.UpstreamBaseURL, server.config.UpstreamAPIKey)
+	server.routeTable.Store(identity, "messages-model", RouteEntry{
+		ModelID:    "messages-model",
+		Protocol:   RouteProtocolMessages,
+		Endpoint:   "/v1/messages",
+		Confidence: RouteConfidenceExplicit,
+		Features:   []string{"text-only", "thinking", "no-image", "no-audio"},
+	})
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+		"model":"messages-model",
+		"reasoning":{"effort":"high"},
+		"input":[
+			{"type":"input_image","image_url":"https://example.com/image.png"},
+			{"type":"input_audio","input_audio":{"format":"wav","data":"QUJD"}}
+		]
+	}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if thinking, _ := upstreamBody["thinking"].(map[string]any); thinking["type"] != "enabled" {
+		t.Fatalf("expected route features to enable thinking, got %#v", upstreamBody["thinking"])
+	}
+
+	messages, _ := upstreamBody["messages"].([]any)
+	if len(messages) != 2 {
+		t.Fatalf("expected two downgraded user messages, got %#v", upstreamBody["messages"])
+	}
+	for _, raw := range messages {
+		message, _ := raw.(map[string]any)
+		content, _ := message["content"].([]any)
+		if len(content) != 1 || content[0].(map[string]any)["type"] != "text" {
+			t.Fatalf("expected route text-only downgrade, got %#v", message)
+		}
+	}
+}
+
+func TestChatCompletionsPassesThroughOnlyWhenRouteIsChat(t *testing.T) {
+	t.Run("route chat passes through", func(t *testing.T) {
+		var upstreamPath string
+		var rawBody string
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			upstreamPath = r.URL.Path
+			bodyBytes, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("ReadAll upstream body returned error: %v", err)
+			}
+			rawBody = string(bodyBytes)
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": "chatcmpl-pass"})
+		}))
+		defer upstream.Close()
+
+		server := newRouteAwareTestServer(upstream.URL+"/v1", "upstream-secret")
+		storeTestRoute(server, "chat-model", RouteProtocolChat, "/v1/chat/completions")
+
+		body := `{"model":"chat-model","messages":[{"role":"user","content":"hi"}],"temperature":0.2}`
+		request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		recorder := httptest.NewRecorder()
+
+		server.ServeHTTP(recorder, request)
+
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+		}
+		if upstreamPath != "/v1/chat/completions" {
+			t.Fatalf("unexpected upstream path: %s", upstreamPath)
+		}
+		assertJSONTextEqual(t, body, rawBody)
+	})
+
+	for _, protocol := range []RouteProtocol{RouteProtocolResponses, RouteProtocolMessages} {
+		t.Run("route "+string(protocol)+" rejects cross protocol", func(t *testing.T) {
+			upstreamCalled := false
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				upstreamCalled = true
+			}))
+			defer upstream.Close()
+
+			server := newRouteAwareTestServer(upstream.URL+"/v1", "upstream-secret")
+			storeTestRoute(server, "not-chat-model", protocol, defaultEndpointForProtocol(protocol))
+
+			request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"not-chat-model","messages":[]}`))
+			request.Header.Set("Content-Type", "application/json")
+			recorder := httptest.NewRecorder()
+
+			server.ServeHTTP(recorder, request)
+
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+			}
+			assertErrorTypeAndCode(t, recorder.Body.Bytes(), "invalid_request_error", "unsupported_protocol")
+			if upstreamCalled {
+				t.Fatal("expected unsupported chat route not to call upstream")
+			}
+		})
+	}
+}
+
+func TestMessagesEndpointCanPassThroughWhenUpstreamProtocolMatches(t *testing.T) {
+	t.Run("route messages passes through", func(t *testing.T) {
+		var upstreamPath string
+		var rawBody string
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			upstreamPath = r.URL.Path
+			bodyBytes, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("ReadAll upstream body returned error: %v", err)
+			}
+			rawBody = string(bodyBytes)
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": "msg-pass"})
+		}))
+		defer upstream.Close()
+
+		server := newRouteAwareTestServer(upstream.URL+"/v1", "upstream-secret")
+		storeTestRoute(server, "messages-model", RouteProtocolMessages, "/v1/messages")
+
+		body := `{"model":"messages-model","messages":[{"role":"user","content":"hi"}],"max_tokens":20}`
+		request := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		recorder := httptest.NewRecorder()
+
+		server.ServeHTTP(recorder, request)
+
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+		}
+		if upstreamPath != "/v1/messages" {
+			t.Fatalf("unexpected upstream path: %s", upstreamPath)
+		}
+		assertJSONTextEqual(t, body, rawBody)
+	})
+
+	for _, protocol := range []RouteProtocol{RouteProtocolChat, RouteProtocolResponses} {
+		t.Run("route "+string(protocol)+" rejects cross protocol", func(t *testing.T) {
+			upstreamCalled := false
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				upstreamCalled = true
+			}))
+			defer upstream.Close()
+
+			server := newRouteAwareTestServer(upstream.URL+"/v1", "upstream-secret")
+			storeTestRoute(server, "not-messages-model", protocol, defaultEndpointForProtocol(protocol))
+
+			request := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"not-messages-model","messages":[]}`))
+			request.Header.Set("Content-Type", "application/json")
+			recorder := httptest.NewRecorder()
+
+			server.ServeHTTP(recorder, request)
+
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+			}
+			assertErrorTypeAndCode(t, recorder.Body.Bytes(), "invalid_request_error", "unsupported_protocol")
+			if upstreamCalled {
+				t.Fatal("expected unsupported messages route not to call upstream")
+			}
+		})
+	}
+}
+
+func TestMessagesStreamFalseUsesNormalPassthrough(t *testing.T) {
+	var upstreamPath string
+	var upstreamBody map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamPath = r.URL.Path
+		if got := r.Header.Get("Content-Type"); got != "application/json" {
+			t.Fatalf("unexpected content type: %s", got)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&upstreamBody); err != nil {
+			t.Fatalf("Decode upstream body returned error: %v", err)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":      "msg-pass",
+			"object":  "message",
+			"content": "ok",
+		})
+	}))
+	defer upstream.Close()
+
+	server := newRouteAwareTestServer(upstream.URL+"/v1", "upstream-secret")
+	storeTestRoute(server, "messages-model", RouteProtocolMessages, "/v1/messages")
+
+	body := `{"model":"messages-model","messages":[{"role":"user","content":"hi"}],"stream":false,"max_tokens":20}`
+	request := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if upstreamPath != "/v1/messages" {
+		t.Fatalf("unexpected upstream path: %s", upstreamPath)
+	}
+	if upstreamBody["stream"] != false {
+		t.Fatalf("expected upstream to receive stream=false, got %#v", upstreamBody["stream"])
+	}
+	if got := recorder.Header().Get("Content-Type"); !strings.HasPrefix(got, "application/json") {
+		t.Fatalf("unexpected content type: %s body=%s", got, recorder.Body.String())
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("json.Unmarshal returned error: %v body=%s", err, recorder.Body.String())
+	}
+	if payload["id"] != "msg-pass" {
+		t.Fatalf("unexpected response payload: %#v", payload)
+	}
+}
+
+func TestUnsupportedProtocolReturnsClearError(t *testing.T) {
+	server := newRouteAwareTestServer("https://example.test/v1", "upstream-secret")
+	storeTestRoute(server, "responses-model", RouteProtocolResponses, "/v1/responses")
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"responses-model","messages":[]}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	assertErrorTypeAndCode(t, recorder.Body.Bytes(), "invalid_request_error", "unsupported_protocol")
+	assertContains(t, recorder.Body.String(), "does not support chat")
+}
+
+func TestModelsEndpointStillSkipsProxyAuth(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data": []any{
+				map[string]any{
+					"id":                  "public-model",
+					"supported_endpoints": []any{"responses"},
+				},
+			},
+		})
+	}))
+	defer upstream.Close()
+
+	server := NewServer(Config{
+		UpstreamBaseURL: upstream.URL + "/v1",
+		ProxyAPIKey:     "proxy-secret",
+		UpstreamAPIKey:  "upstream-secret",
+		RequestTimeout:  secondsToDuration(5),
+		StreamTimeout:   secondsToDuration(5),
+		VerifySSL:       true,
+	})
+
+	identity := RouteIdentityKey(server.config.UpstreamBaseURL, server.config.UpstreamAPIKey)
+	server.routeTable.Store(identity, "legacy-model", RouteEntry{
+		ModelID:    "legacy-model",
+		Protocol:   RouteProtocolChat,
+		Endpoint:   "/v1/chat/completions",
+		Confidence: RouteConfidenceExplicit,
+	})
+
+	request := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	assertContains(t, recorder.Body.String(), `"id":"public-model"`)
+	if _, ok := server.routeTable.Resolve(identity, "legacy-model"); !ok {
+		t.Fatal("expected unauthenticated models request to leave existing route snapshot intact")
+	}
+	if _, ok := server.routeTable.Resolve(identity, "public-model"); ok {
+		t.Fatal("expected unauthenticated models request not to refresh route table")
+	}
+}
+
+func TestControlledEntrypointsRequireProxyAuth(t *testing.T) {
+	for _, path := range []string{"/v1/chat/completions", "/v1/messages"} {
+		t.Run(path, func(t *testing.T) {
+			server := NewServer(Config{
+				ProxyAPIKey:    "proxy-secret",
+				RequestTimeout: secondsToDuration(5),
+				StreamTimeout:  secondsToDuration(5),
+				VerifySSL:      true,
+			})
+
+			request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"model":"test-model","messages":[]}`))
+			request.Header.Set("Content-Type", "application/json")
+			recorder := httptest.NewRecorder()
+
+			server.ServeHTTP(recorder, request)
+
+			if recorder.Code != http.StatusUnauthorized {
+				t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+			}
+			assertContains(t, recorder.Body.String(), `"code":"invalid_api_key"`)
+		})
+	}
+}
+
+func TestControlledEntrypointsRejectNonPostWithoutForwarding(t *testing.T) {
+	for _, path := range []string{"/v1/chat/completions", "/v1/messages"} {
+		t.Run(path, func(t *testing.T) {
+			upstreamCalled := false
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				upstreamCalled = true
+				t.Fatalf("unexpected upstream call for %s %s", r.Method, r.URL.Path)
+			}))
+			defer upstream.Close()
+
+			server := NewServer(Config{
+				UpstreamBaseURL: upstream.URL + "/v1",
+				ProxyAPIKey:     "proxy-secret",
+				RequestTimeout:  secondsToDuration(5),
+				StreamTimeout:   secondsToDuration(5),
+				VerifySSL:       true,
+			})
+
+			request := httptest.NewRequest(http.MethodGet, path, nil)
+			recorder := httptest.NewRecorder()
+
+			server.ServeHTTP(recorder, request)
+
+			if recorder.Code != http.StatusMethodNotAllowed {
+				t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+			}
+			assertErrorTypeAndCode(t, recorder.Body.Bytes(), "invalid_request_error", "method_not_allowed")
+			if got := recorder.Header().Get("Allow"); got != http.MethodPost {
+				t.Fatalf("unexpected Allow header: %q", got)
+			}
+			if upstreamCalled {
+				t.Fatal("expected non-POST controlled entrypoint not to call upstream")
+			}
+		})
 	}
 }
 
@@ -193,6 +971,215 @@ func TestForwardUnknownV1SkipsProxyAuth(t *testing.T) {
 	assertContains(t, recorder.Body.String(), `"id":"m1"`)
 }
 
+func TestModelsEndpointDoesNotRefreshRouteSnapshotWithoutProxyAuth(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data": []any{
+				map[string]any{
+					"id":                  "public-model",
+					"supported_endpoints": []any{"responses"},
+				},
+			},
+		})
+	}))
+	defer upstream.Close()
+
+	server := NewServer(Config{
+		UpstreamBaseURL: upstream.URL + "/v1",
+		ProxyAPIKey:     "proxy-secret",
+		UpstreamAPIKey:  "upstream-secret",
+		RequestTimeout:  secondsToDuration(5),
+		StreamTimeout:   secondsToDuration(5),
+		VerifySSL:       true,
+	})
+
+	identity := RouteIdentityKey(server.config.UpstreamBaseURL, server.config.UpstreamAPIKey)
+	server.routeTable.Store(identity, "legacy-model", RouteEntry{
+		ModelID:    "legacy-model",
+		Protocol:   RouteProtocolChat,
+		Endpoint:   "/v1/chat/completions",
+		Confidence: RouteConfidenceExplicit,
+	})
+
+	request := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	assertContains(t, recorder.Body.String(), `"id":"public-model"`)
+
+	if _, ok := server.routeTable.Resolve(identity, "legacy-model"); !ok {
+		t.Fatal("expected route snapshot to remain unchanged for unauthorized request")
+	}
+	if _, ok := server.routeTable.Resolve(identity, "public-model"); ok {
+		t.Fatal("expected unauthorized request to skip shared route refresh")
+	}
+}
+
+func TestModelsEndpointKeepsLegacyRouteWhenDiscoveryReturnsOnlyEmptyCatalog(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			fallthrough
+		case "/models":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"data":[]}`))
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer upstream.Close()
+
+	server := NewServer(Config{
+		UpstreamBaseURL: upstream.URL + "/v1",
+		ProxyAPIKey:     "proxy-secret",
+		UpstreamAPIKey:  "upstream-secret",
+		RequestTimeout:  secondsToDuration(5),
+		StreamTimeout:   secondsToDuration(5),
+		VerifySSL:       true,
+	})
+
+	identity := RouteIdentityKey(server.config.UpstreamBaseURL, server.config.UpstreamAPIKey)
+	server.routeTable.Store(identity, "legacy-model", RouteEntry{
+		ModelID:    "legacy-model",
+		Protocol:   RouteProtocolChat,
+		Endpoint:   "/v1/chat/completions",
+		Confidence: RouteConfidenceExplicit,
+	})
+
+	request := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	request.Header.Set("Authorization", "Bearer proxy-secret")
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code == http.StatusOK {
+		t.Fatalf("expected discovery failure, got 200 body=%s", recorder.Body.String())
+	}
+	if _, ok := server.routeTable.Resolve(identity, "legacy-model"); !ok {
+		t.Fatal("expected legacy route to remain when discovery returns no models")
+	}
+}
+
+func TestModelsEndpointFailsClosedOnErrorPayloadWithEmptyData(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/anthropic/v1/models":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"error":{"message":"bad"},"data":[]}`))
+		case "/anthropic/models":
+			t.Fatal("discovery should not continue after an error payload with empty data")
+		case "/v1/models":
+			t.Fatal("discovery should not continue after an error payload with empty data")
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer upstream.Close()
+
+	server := NewServer(Config{
+		UpstreamBaseURL: upstream.URL + "/anthropic",
+		ProxyAPIKey:     "proxy-secret",
+		UpstreamAPIKey:  "upstream-secret",
+		RequestTimeout:  secondsToDuration(5),
+		StreamTimeout:   secondsToDuration(5),
+		VerifySSL:       true,
+	})
+
+	identity := RouteIdentityKey(server.config.UpstreamBaseURL, server.config.UpstreamAPIKey)
+	server.routeTable.Store(identity, "legacy-model", RouteEntry{
+		ModelID:    "legacy-model",
+		Protocol:   RouteProtocolChat,
+		Endpoint:   "/v1/chat/completions",
+		Confidence: RouteConfidenceExplicit,
+	})
+
+	request := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	request.Header.Set("Authorization", "Bearer proxy-secret")
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	assertContains(t, strings.ToLower(recorder.Body.String()), "unrecognized")
+
+	if _, ok := server.routeTable.Resolve(identity, "legacy-model"); !ok {
+		t.Fatal("expected route snapshot to remain unchanged after discovery failure")
+	}
+	if _, ok := server.routeTable.Resolve(identity, "bad"); ok {
+		t.Fatal("expected failed discovery to avoid replacing the route snapshot")
+	}
+}
+
+func TestModelsEndpointFailsClosedOnMixedValidAndMalformedCatalog(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{
+				"data": [
+					{
+						"id": "public-model",
+						"supported_endpoints": ["responses"]
+					},
+					{
+						"supported_endpoints": ["responses"],
+						"features": ["streaming"]
+					}
+				]
+			}`))
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer upstream.Close()
+
+	server := NewServer(Config{
+		UpstreamBaseURL: upstream.URL + "/v1",
+		ProxyAPIKey:     "proxy-secret",
+		UpstreamAPIKey:  "upstream-secret",
+		RequestTimeout:  secondsToDuration(5),
+		StreamTimeout:   secondsToDuration(5),
+		VerifySSL:       true,
+	})
+
+	identity := RouteIdentityKey(server.config.UpstreamBaseURL, server.config.UpstreamAPIKey)
+	server.routeTable.Store(identity, "legacy-model", RouteEntry{
+		ModelID:    "legacy-model",
+		Protocol:   RouteProtocolChat,
+		Endpoint:   "/v1/chat/completions",
+		Confidence: RouteConfidenceExplicit,
+	})
+
+	request := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	request.Header.Set("Authorization", "Bearer proxy-secret")
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("expected mixed catalog to fail closed, got %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	assertContains(t, strings.ToLower(recorder.Body.String()), "unrecognized")
+
+	if _, ok := server.routeTable.Resolve(identity, "legacy-model"); !ok {
+		t.Fatal("expected legacy route to remain after mixed catalog failure")
+	}
+	if _, ok := server.routeTable.Resolve(identity, "public-model"); ok {
+		t.Fatal("expected malformed catalog to avoid refreshing new routes")
+	}
+}
+
 func TestChatCompletionsStreamSynthesizesFinishReasonOnEOF(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -218,6 +1205,7 @@ func TestChatCompletionsStreamSynthesizesFinishReasonOnEOF(t *testing.T) {
 		StreamTimeout:   secondsToDuration(5),
 		VerifySSL:       true,
 	})
+	storeTestRoute(server, "test-model", RouteProtocolChat, "/v1/chat/completions")
 
 	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test-model","messages":[],"stream":true}`))
 	request.Header.Set("Content-Type", "application/json")
@@ -256,6 +1244,7 @@ func TestChatCompletionsStreamInsertsFinishReasonBeforeDone(t *testing.T) {
 		StreamTimeout:   secondsToDuration(5),
 		VerifySSL:       true,
 	})
+	storeTestRoute(server, "test-model", RouteProtocolChat, "/v1/chat/completions")
 
 	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test-model","messages":[],"stream":true}`))
 	request.Header.Set("Content-Type", "application/json")
@@ -268,5 +1257,50 @@ func TestChatCompletionsStreamInsertsFinishReasonBeforeDone(t *testing.T) {
 	doneIndex := strings.Index(body, "data: [DONE]")
 	if finishIndex < 0 || doneIndex < 0 || finishIndex > doneIndex {
 		t.Fatalf("expected synthesized finish_reason before [DONE], body=%s", body)
+	}
+}
+
+func TestChatCompletionsStreamIgnoresEventsAfterDone(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: " + mustJSON(map[string]any{
+			"id":      "chatcmpl-abc",
+			"object":  "chat.completion.chunk",
+			"created": 123,
+			"model":   "test-model",
+			"choices": []any{
+				map[string]any{
+					"index":         0,
+					"delta":         map[string]any{"content": "Hi"},
+					"finish_reason": nil,
+				},
+			},
+		}) + "\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		_, _ = w.Write([]byte("data: {\"choices\":[],\"cost\":\"0\"}\n\n"))
+	}))
+	defer upstream.Close()
+
+	server := NewServer(Config{
+		UpstreamBaseURL: upstream.URL + "/v1",
+		RequestTimeout:  secondsToDuration(5),
+		StreamTimeout:   secondsToDuration(5),
+		VerifySSL:       true,
+	})
+	storeTestRoute(server, "test-model", RouteProtocolChat, "/v1/chat/completions")
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test-model","messages":[],"stream":true}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	body := recorder.Body.String()
+	doneIndex := strings.Index(body, "data: [DONE]")
+	if doneIndex < 0 {
+		t.Fatalf("expected [DONE] marker in body=%s", body)
+	}
+	if strings.Contains(body, `"cost":"0"`) {
+		t.Fatalf("expected stream to stop at [DONE], body=%s", body)
 	}
 }
