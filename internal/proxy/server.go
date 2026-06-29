@@ -415,6 +415,10 @@ func (s *Server) streamResponses(w http.ResponseWriter, r *http.Request, _ map[s
 
 	resp, err := s.doStreamRequestWithKeyFailover(ctx, http.MethodPost, endpointURL, r.Header, body, true)
 	if err != nil {
+		if errors.Is(err, errAllUpstreamKeysRateLimited) {
+			s.writeUpstreamRequestError(w, err)
+			return
+		}
 		s.writeStreamFailure(w, err, NewStreamingConverter())
 		return
 	}
@@ -508,6 +512,10 @@ func (s *Server) streamMessages(w http.ResponseWriter, r *http.Request, original
 
 	resp, err := s.doStreamRequestWithKeyFailover(ctx, http.MethodPost, endpointURL, r.Header, body, true)
 	if err != nil {
+		if errors.Is(err, errAllUpstreamKeysRateLimited) {
+			s.writeUpstreamRequestError(w, err)
+			return
+		}
 		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-cache, no-transform")
 		w.Header().Set("X-Accel-Buffering", "no")
@@ -602,6 +610,10 @@ func (s *Server) passthroughStream(w http.ResponseWriter, r *http.Request, body 
 
 	resp, err := s.doStreamRequestWithKeyFailover(ctx, http.MethodPost, endpointURL, r.Header, payload, protocol != RouteProtocolChat)
 	if err != nil {
+		if errors.Is(err, errAllUpstreamKeysRateLimited) {
+			s.writeUpstreamRequestError(w, err)
+			return
+		}
 		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-cache, no-transform")
 		w.Header().Set("X-Accel-Buffering", "no")
@@ -714,7 +726,7 @@ func (s *Server) resolveRouteLazily(ctx context.Context, incoming http.Header, m
 		return RouteEntry{}, false, nil
 	}
 
-	selection, err := discoverModelSelection(ctx, s.normalClient, s.config, incoming)
+	selection, err := discoverModelSelection(ctx, s.normalClient, s.config, incoming, s.keySelector)
 	if err == nil {
 		ApplyDiscoveredModels(s.routeTable, identity, selection.Results)
 		if route, ok := s.routeTable.Resolve(identity, model); ok {

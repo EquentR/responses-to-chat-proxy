@@ -892,9 +892,6 @@ func convertMessagesUsage(raw any) map[string]any {
 	}
 
 	cached := intValue(usage["cache_read_input_tokens"])
-	if cached == 0 {
-		cached = intValue(usage["cache_creation_input_tokens"])
-	}
 	reasoningTokens := intValue(usage["reasoning_tokens"])
 	if details, ok := usage["output_tokens_details"].(map[string]any); ok {
 		if reasoningTokens == 0 {
@@ -938,22 +935,22 @@ func mapMessagesStopReason(stopReason string, output []any) (string, map[string]
 // -----------------------------------------------------------------------------
 
 type MessagesStreamingConverter struct {
-	originalReq map[string]any
-	buffer      string
-	initialized bool
-	completed   bool
-	responseID  string
-	model       string
-	createdAt   int
-	role        string
-	stopReason  string
-	sawMessageStop bool
-	text        strings.Builder
-	reasoning   strings.Builder
-	toolCalls   map[int]*messagesStreamToolCall
-	usage       map[string]any
-	nextOutputIndex int
-	messageOutputIndex *int
+	originalReq          map[string]any
+	buffer               string
+	initialized          bool
+	completed            bool
+	responseID           string
+	model                string
+	createdAt            int
+	role                 string
+	stopReason           string
+	sawMessageStop       bool
+	text                 strings.Builder
+	reasoning            strings.Builder
+	toolCalls            map[int]*messagesStreamToolCall
+	usage                map[string]any
+	nextOutputIndex      int
+	messageOutputIndex   *int
 	reasoningOutputIndex *int
 }
 
@@ -1207,27 +1204,27 @@ func (c *MessagesStreamingConverter) buildOutput() []any {
 		indexed = append(indexed, indexedOutputItem{
 			index: c.reasoningOutputIndexValue(),
 			item: map[string]any{
-			"type":   "reasoning",
-			"id":     c.reasoningItemID(),
-			"status": "completed",
-			"summary": []any{
-				map[string]any{"type": "summary_text", "text": reasoning},
+				"type":   "reasoning",
+				"id":     c.reasoningItemID(),
+				"status": "completed",
+				"summary": []any{
+					map[string]any{"type": "summary_text", "text": reasoning},
+				},
 			},
-		},
 		})
 	}
 	if text := strings.TrimSpace(c.text.String()); text != "" {
 		indexed = append(indexed, indexedOutputItem{
 			index: c.messageOutputIndexValue(),
 			item: map[string]any{
-			"type":   "message",
-			"id":     c.messageItemID(),
-			"status": "completed",
-			"role":   c.role,
-			"content": []any{
-				map[string]any{"type": "output_text", "text": text, "annotations": []any{}},
+				"type":   "message",
+				"id":     c.messageItemID(),
+				"status": "completed",
+				"role":   c.role,
+				"content": []any{
+					map[string]any{"type": "output_text", "text": text, "annotations": []any{}},
+				},
 			},
-		},
 		})
 	}
 

@@ -32,7 +32,7 @@ func DiscoverModels(ctx context.Context, client *http.Client, cfg Config) ([]Mod
 		client = http.DefaultClient
 	}
 
-	selection, err := discoverModelSelection(ctx, client, cfg, nil)
+	selection, err := discoverModelSelection(ctx, client, cfg, nil, newUpstreamKeySelector(configuredUpstreamKeys(cfg), upstreamKeyCooldown(cfg)))
 	if err != nil {
 		return nil, err
 	}
@@ -76,6 +76,7 @@ type modelDiscoverySelection struct {
 type modelDiscoveryError struct {
 	statusCode int
 	message    string
+	code       string
 }
 
 type modelDiscoveryNoEvidenceError struct {
@@ -96,16 +97,23 @@ func (e *modelDiscoveryNoEvidenceError) Error() string {
 	return e.message
 }
 
-func fetchModelDiscoveryPage(ctx context.Context, client *http.Client, cfg Config, incoming http.Header, candidate string) (modelDiscoveryPage, error) {
-	selector := newUpstreamKeySelector(configuredUpstreamKeys(cfg), upstreamKeyCooldown(cfg))
+func upstreamKeysRateLimitedDiscoveryError() *modelDiscoveryError {
+	return &modelDiscoveryError{
+		statusCode: http.StatusServiceUnavailable,
+		message:    "models discovery failed: all upstream API keys are rate limited",
+		code:       "upstream_keys_rate_limited",
+	}
+}
+
+func fetchModelDiscoveryPage(ctx context.Context, client *http.Client, cfg Config, incoming http.Header, candidate string, selector *upstreamKeySelector) (modelDiscoveryPage, error) {
+	if selector == nil {
+		selector = newUpstreamKeySelector(configuredUpstreamKeys(cfg), upstreamKeyCooldown(cfg))
+	}
 	attempts := selector.attempts()
 	if len(attempts) == 0 {
-		return modelDiscoveryPage{}, &modelDiscoveryError{
-			statusCode: http.StatusServiceUnavailable,
-			message:    "models discovery failed: all upstream API keys are rate limited",
-		}
+		return modelDiscoveryPage{}, upstreamKeysRateLimitedDiscoveryError()
 	}
-	retryRateLimited := len(configuredUpstreamKeys(cfg)) > 1
+	retryRateLimited := selectorHasMultipleConfiguredKeys(selector)
 
 	for _, attempt := range attempts {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, candidate, nil)
@@ -139,15 +147,24 @@ func fetchModelDiscoveryPage(ctx context.Context, client *http.Client, cfg Confi
 		}, nil
 	}
 
-	return modelDiscoveryPage{}, &modelDiscoveryError{
-		statusCode: http.StatusServiceUnavailable,
-		message:    "models discovery failed: all upstream API keys are rate limited",
-	}
+	return modelDiscoveryPage{}, upstreamKeysRateLimitedDiscoveryError()
 }
 
-func discoverModelSelection(ctx context.Context, client *http.Client, cfg Config, incoming http.Header) (modelDiscoverySelection, error) {
+func selectorHasMultipleConfiguredKeys(selector *upstreamKeySelector) bool {
+	if selector == nil {
+		return false
+	}
+	selector.mu.Lock()
+	defer selector.mu.Unlock()
+	return len(selector.keys) > 1
+}
+
+func discoverModelSelection(ctx context.Context, client *http.Client, cfg Config, incoming http.Header, selector *upstreamKeySelector) (modelDiscoverySelection, error) {
 	if client == nil {
 		client = http.DefaultClient
+	}
+	if selector == nil {
+		selector = newUpstreamKeySelector(configuredUpstreamKeys(cfg), upstreamKeyCooldown(cfg))
 	}
 
 	candidates := modelDiscoveryCandidates(cfg.UpstreamBaseURL, cfg.UpstreamModelsURL)
@@ -160,7 +177,7 @@ func discoverModelSelection(ctx context.Context, client *http.Client, cfg Config
 	var sawEmptyPage bool
 
 	for _, candidate := range candidates {
-		page, err := fetchModelDiscoveryPage(ctx, client, cfg, incoming, candidate)
+		page, err := fetchModelDiscoveryPage(ctx, client, cfg, incoming, candidate, selector)
 		if err != nil {
 			return modelDiscoverySelection{}, err
 		}
@@ -230,7 +247,7 @@ func (s *Server) initializeStartupDiscovery(ctx context.Context) error {
 		return nil
 	}
 
-	selection, err := discoverModelSelection(ctx, s.normalClient, s.config, nil)
+	selection, err := discoverModelSelection(ctx, s.normalClient, s.config, nil, s.keySelector)
 	if err != nil {
 		return err
 	}
@@ -240,7 +257,7 @@ func (s *Server) initializeStartupDiscovery(ctx context.Context) error {
 }
 
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
-	selection, err := discoverModelSelection(r.Context(), s.normalClient, s.config, r.Header)
+	selection, err := discoverModelSelection(r.Context(), s.normalClient, s.config, r.Header, s.keySelector)
 	if err != nil {
 		writeDiscoveryError(w, err)
 		return
@@ -587,19 +604,29 @@ func writeDiscoveryError(w http.ResponseWriter, err error) {
 
 	statusCode := http.StatusBadGateway
 	message := "Models discovery failed."
+	code := ""
 
 	var discoveryErr *modelDiscoveryError
 	if errors.As(err, &discoveryErr) {
 		statusCode = discoveryErr.statusCode
 		message = discoveryErr.message
+		code = discoveryErr.code
+	} else if errors.Is(err, errAllUpstreamKeysRateLimited) {
+		discoveryErr := upstreamKeysRateLimitedDiscoveryError()
+		statusCode = discoveryErr.statusCode
+		message = discoveryErr.message
+		code = discoveryErr.code
 	} else if errors.Is(err, context.DeadlineExceeded) {
 		statusCode = http.StatusGatewayTimeout
 		message = "Models discovery timed out."
 	} else {
 		message = trimMessage(err.Error())
 	}
+	if code == "" {
+		code = fmt.Sprintf("http_%d", statusCode)
+	}
 
-	writeJSON(w, statusCode, errorPayload(message, "upstream_error", fmt.Sprintf("http_%d", statusCode)))
+	writeJSON(w, statusCode, errorPayload(message, "upstream_error", code))
 }
 
 func mapsFromSlice(values []any) []map[string]any {

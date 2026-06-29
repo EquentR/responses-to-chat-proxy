@@ -730,6 +730,71 @@ func TestDefaultLazyRouteResolverSurfacesModelsRateLimit(t *testing.T) {
 	assertContains(t, recorder.Body.String(), "models discovery failed")
 }
 
+func TestModelsEndpointReturnsUpstreamKeysRateLimitedWhenAllKeysExhausted(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusTooManyRequests)
+		_ = json.NewEncoder(w).Encode(errorPayload("rate limited", "rate_limit_error", "rate_limit_exceeded"))
+	}))
+	defer upstream.Close()
+
+	server := NewServer(Config{
+		UpstreamBaseURL:     upstream.URL + "/v1",
+		UpstreamAPIKey:      "sk-a,sk-b",
+		UpstreamAPIKeys:     []string{"sk-a", "sk-b"},
+		UpstreamKeyCooldown: secondsToDuration(30),
+		RequestTimeout:      secondsToDuration(5),
+		StreamTimeout:       secondsToDuration(5),
+		VerifySSL:           true,
+	})
+	request := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	assertErrorTypeAndCode(t, recorder.Body.Bytes(), "upstream_error", "upstream_keys_rate_limited")
+}
+
+func TestLazyRouteProbeReturnsUpstreamKeysRateLimitedWhenAllKeysExhausted(t *testing.T) {
+	var paths []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		if r.URL.Path == "/v1/models" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": []any{}})
+			return
+		}
+		w.WriteHeader(http.StatusTooManyRequests)
+		_ = json.NewEncoder(w).Encode(errorPayload("rate limited", "rate_limit_error", "rate_limit_exceeded"))
+	}))
+	defer upstream.Close()
+
+	server := NewServer(Config{
+		UpstreamBaseURL:      upstream.URL + "/v1",
+		UpstreamAPIKey:       "sk-a,sk-b",
+		UpstreamAPIKeys:      []string{"sk-a", "sk-b"},
+		UpstreamKeyCooldown:  secondsToDuration(30),
+		RouteProbeGeneration: true,
+		RequestTimeout:       secondsToDuration(5),
+		StreamTimeout:        secondsToDuration(5),
+		VerifySSL:            true,
+	})
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"probe-model","input":"hello"}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("unexpected status: %d body=%s paths=%#v", recorder.Code, recorder.Body.String(), paths)
+	}
+	assertErrorTypeAndCode(t, recorder.Body.Bytes(), "upstream_error", "upstream_keys_rate_limited")
+}
+
 func TestNonStreamingResponsesToChatUsesThinkingRectifier(t *testing.T) {
 	callCount := 0
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1652,6 +1717,48 @@ func TestResponsesStreamRetriesWithNextKeyOnRateLimitBeforeWritingSSE(t *testing
 		t.Fatalf("expected retry to hide upstream 429 body, got %s", recorder.Body.String())
 	}
 	assertJSONEqual(t, []string{"Bearer sk-a", "Bearer sk-b"}, seenAuth)
+}
+
+func TestResponsesStreamReturns503WhenAllKeysAreRateLimited(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte("data: " + mustJSON(errorPayload("rate limited", "rate_limit_error", "rate_limit_exceeded")) + "\n\n"))
+	}))
+	defer upstream.Close()
+
+	server := newMultiKeyRouteAwareTestServer(upstream.URL+"/v1", RouteProtocolChat)
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"test-model","input":"hello","stream":true}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	assertErrorTypeAndCode(t, recorder.Body.Bytes(), "upstream_error", "upstream_keys_rate_limited")
+}
+
+func TestMessagesStreamReturns503WhenAllKeysAreRateLimited(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte("event: error\ndata: " + mustJSON(errorPayload("rate limited", "rate_limit_error", "rate_limit_exceeded")) + "\n\n"))
+	}))
+	defer upstream.Close()
+
+	server := newMultiKeyRouteAwareTestServer(upstream.URL+"/v1", RouteProtocolMessages)
+	request := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"test-model","messages":[{"role":"user","content":"hello"}],"stream":true,"max_tokens":10}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	assertErrorTypeAndCode(t, recorder.Body.Bytes(), "upstream_error", "upstream_keys_rate_limited")
 }
 
 func TestResponsesEndpointReturns503WhenAllKeysAreRateLimited(t *testing.T) {

@@ -389,6 +389,55 @@ func TestConvertMessagesToResponsesHandlesTextThinkingAndTools(t *testing.T) {
 	}
 }
 
+func TestConvertMessagesToResponsesPropagatesCacheReadTokens(t *testing.T) {
+	converted := ConvertMessagesToResponses(map[string]any{
+		"id":    "msg-123",
+		"model": "claude-4",
+		"role":  "assistant",
+		"content": []any{
+			map[string]any{"type": "text", "text": "Hello"},
+		},
+		"usage": map[string]any{
+			"input_tokens":            20,
+			"output_tokens":           3,
+			"total_tokens":            23,
+			"cache_read_input_tokens": 12,
+		},
+		"stop_reason": "end_turn",
+	}, map[string]any{"model": "claude-4", "input": "hi"})
+
+	usage := converted["usage"].(map[string]any)
+	inputDetails := usage["input_tokens_details"].(map[string]any)
+	if inputDetails["cached_tokens"] != 12 {
+		t.Fatalf("expected cached_tokens=12, got %#v", usage)
+	}
+}
+
+func TestConvertMessagesToResponsesDoesNotTreatCacheCreationAsCacheRead(t *testing.T) {
+	converted := ConvertMessagesToResponses(map[string]any{
+		"id":    "msg-123",
+		"model": "claude-4",
+		"role":  "assistant",
+		"content": []any{
+			map[string]any{"type": "text", "text": "Hello"},
+		},
+		"usage": map[string]any{
+			"input_tokens":                20,
+			"output_tokens":               3,
+			"total_tokens":                23,
+			"cache_read_input_tokens":     0,
+			"cache_creation_input_tokens": 20,
+		},
+		"stop_reason": "end_turn",
+	}, map[string]any{"model": "claude-4", "input": "hi"})
+
+	usage := converted["usage"].(map[string]any)
+	inputDetails := usage["input_tokens_details"].(map[string]any)
+	if inputDetails["cached_tokens"] != 0 {
+		t.Fatalf("cache creation must not count as cache read, got %#v", usage)
+	}
+}
+
 func TestConvertMessagesToResponsesIgnoresUnknownBlocks(t *testing.T) {
 	converted := ConvertMessagesToResponses(map[string]any{
 		"id":    "msg-123",
@@ -512,16 +561,67 @@ func TestConvertMessagesStreamToResponsesSSE(t *testing.T) {
 	}
 }
 
+func TestMessagesStreamingConverterPropagatesCacheReadTokens(t *testing.T) {
+	converter := NewMessagesStreamingConverter(map[string]any{"model": "claude-4", "input": "hi"})
+	events := converter.Feed([]byte("event: message_delta\ndata: " + mustJSON(map[string]any{
+		"delta": map[string]any{"stop_reason": "end_turn"},
+		"usage": map[string]any{
+			"input_tokens":            20,
+			"output_tokens":           3,
+			"total_tokens":            23,
+			"cache_read_input_tokens": 12,
+		},
+	}) + "\n\n"))
+	events = append(events, converter.Feed([]byte("event: message_stop\ndata: {}\n\n"))...)
+
+	completed := findPayload(ssePayloads(events), "response.completed")
+	if completed == nil {
+		t.Fatalf("missing response.completed payloads=%#v", events)
+	}
+	response := completed["response"].(map[string]any)
+	usage := response["usage"].(map[string]any)
+	inputDetails := usage["input_tokens_details"].(map[string]any)
+	if inputDetails["cached_tokens"] != float64(12) {
+		t.Fatalf("expected cached_tokens=12, got %#v", usage)
+	}
+}
+
+func TestMessagesStreamingConverterDoesNotTreatCacheCreationAsCacheRead(t *testing.T) {
+	converter := NewMessagesStreamingConverter(map[string]any{"model": "claude-4", "input": "hi"})
+	events := converter.Feed([]byte("event: message_delta\ndata: " + mustJSON(map[string]any{
+		"delta": map[string]any{"stop_reason": "end_turn"},
+		"usage": map[string]any{
+			"input_tokens":                20,
+			"output_tokens":               3,
+			"total_tokens":                23,
+			"cache_read_input_tokens":     0,
+			"cache_creation_input_tokens": 20,
+		},
+	}) + "\n\n"))
+	events = append(events, converter.Feed([]byte("event: message_stop\ndata: {}\n\n"))...)
+
+	completed := findPayload(ssePayloads(events), "response.completed")
+	if completed == nil {
+		t.Fatalf("missing response.completed payloads=%#v", events)
+	}
+	response := completed["response"].(map[string]any)
+	usage := response["usage"].(map[string]any)
+	inputDetails := usage["input_tokens_details"].(map[string]any)
+	if inputDetails["cached_tokens"] != float64(0) {
+		t.Fatalf("cache creation must not count as cache read, got %#v", usage)
+	}
+}
+
 func TestMessagesStreamEOFWithoutStopReasonProducesIncompleteOrFailed(t *testing.T) {
 	t.Run("substantive output becomes incomplete", func(t *testing.T) {
 		converter := NewMessagesStreamingConverter(map[string]any{"model": "claude-4"})
 		events := converter.Feed([]byte("event: message_start\ndata: " + mustJSON(map[string]any{
 			"message": map[string]any{"id": "msg-123", "model": "claude-4", "role": "assistant"},
 		}) + "\n\n"))
-		events = append(events, converter.Feed([]byte("event: content_block_delta\ndata: " + mustJSON(map[string]any{
+		events = append(events, converter.Feed([]byte("event: content_block_delta\ndata: "+mustJSON(map[string]any{
 			"index": 0,
 			"delta": map[string]any{"type": "text_delta", "text": "Hello"},
-		}) + "\n\n"))...)
+		})+"\n\n"))...)
 		events = append(events, converter.Finish()...)
 
 		completed := findPayload(ssePayloads(events), "response.completed")
@@ -553,13 +653,13 @@ func TestMessagesStreamExplicitStopReasonProducesCompleted(t *testing.T) {
 	events := converter.Feed([]byte("event: message_start\ndata: " + mustJSON(map[string]any{
 		"message": map[string]any{"id": "msg-123", "model": "claude-4", "role": "assistant"},
 	}) + "\n\n"))
-	events = append(events, converter.Feed([]byte("event: content_block_delta\ndata: " + mustJSON(map[string]any{
+	events = append(events, converter.Feed([]byte("event: content_block_delta\ndata: "+mustJSON(map[string]any{
 		"index": 0,
 		"delta": map[string]any{"type": "text_delta", "text": "Hello"},
-	}) + "\n\n"))...)
-	events = append(events, converter.Feed([]byte("event: message_delta\ndata: " + mustJSON(map[string]any{
+	})+"\n\n"))...)
+	events = append(events, converter.Feed([]byte("event: message_delta\ndata: "+mustJSON(map[string]any{
 		"delta": map[string]any{"stop_reason": "end_turn"},
-	}) + "\n\n"))...)
+	})+"\n\n"))...)
 	events = append(events, converter.Feed([]byte("event: message_stop\ndata: {}\n\n"))...)
 
 	completed := findPayload(ssePayloads(events), "response.completed")

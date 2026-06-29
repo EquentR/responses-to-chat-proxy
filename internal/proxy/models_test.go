@@ -671,6 +671,52 @@ func TestModelsEndpointRefreshesRouteSnapshot(t *testing.T) {
 	}
 }
 
+func TestModelsEndpointSkipsCoolingServerKey(t *testing.T) {
+	var seenAuth []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		auth := r.Header.Get("Authorization")
+		seenAuth = append(seenAuth, auth)
+		if auth == "Bearer sk-a" {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_ = json.NewEncoder(w).Encode(errorPayload("rate limited", "rate_limit_error", "rate_limit_exceeded"))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data": []any{
+				map[string]any{"id": "gpt-5.1", "protocol": "responses"},
+			},
+		})
+	}))
+	defer upstream.Close()
+
+	server := NewServer(Config{
+		UpstreamBaseURL:     upstream.URL + "/v1",
+		UpstreamAPIKey:      "sk-a,sk-b",
+		UpstreamAPIKeys:     []string{"sk-a", "sk-b"},
+		UpstreamKeyCooldown: 30 * time.Second,
+		RequestTimeout:      secondsToDuration(5),
+		StreamTimeout:       secondsToDuration(5),
+		VerifySSL:           true,
+	})
+	attempts := server.keySelector.attempts()
+	if len(attempts) == 0 || attempts[0].apiKey != "sk-a" {
+		t.Fatalf("expected first attempt to be sk-a, got %#v", attempts)
+	}
+	server.keySelector.markRateLimited(attempts[0])
+
+	request := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	assertJSONEqual(t, []string{"Bearer sk-b"}, seenAuth)
+}
+
 func TestStartupDiscoveryIsOptional(t *testing.T) {
 	t.Parallel()
 
