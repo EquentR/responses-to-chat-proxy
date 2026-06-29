@@ -25,6 +25,7 @@ Copy `.env.example` to `.env` and set:
 ```env
 UPSTREAM_BASE_URL=https://api.openai.com/v1
 UPSTREAM_API_KEY=sk-your-upstream-key
+UPSTREAM_KEY_COOLDOWN_SECONDS=30
 UPSTREAM_MODELS_URL=
 PROXY_API_KEY=
 MODEL_OVERRIDE=
@@ -43,7 +44,14 @@ LOG_LEVEL=info
 REASONING_MODE=
 ```
 
-If `UPSTREAM_API_KEY` is left empty, the proxy forwards the caller's `Authorization`, `x-api-key`, or `x-goog-api-key` header upstream unchanged.
+`UPSTREAM_API_KEY` controls upstream authentication:
+
+- In `.env`, use one key or multiple comma-separated keys for the same upstream base URL.
+- Process environment values may also contain newline-separated keys.
+- With multiple keys, the proxy round-robins requests.
+- If one of multiple configured keys returns 429, it is cooled down for `UPSTREAM_KEY_COOLDOWN_SECONDS` and the request is retried with the next available key rather than returning upstream 429 downstream.
+- Large unmatched `/v1/*` passthrough request bodies are sent in a single attempt and cannot be replayed for failover after upstream starts reading the body.
+- If `UPSTREAM_API_KEY` is empty, caller `Authorization`/`x-api-key`/`x-goog-api-key` passthrough remains unchanged.
 
 ## Routing behavior
 
@@ -94,6 +102,7 @@ Run:
 docker run --rm -p 8000:8000 \
   -e UPSTREAM_BASE_URL=https://api.openai.com/v1 \
   -e UPSTREAM_API_KEY=sk-your-upstream-key \
+  -e UPSTREAM_KEY_COOLDOWN_SECONDS=30 \
   responses-to-chat-proxy:latest
 ```
 

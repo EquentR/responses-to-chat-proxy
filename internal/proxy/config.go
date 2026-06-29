@@ -97,6 +97,20 @@ func parseUpstreamAPIKeys(value string) []string {
 	return keys
 }
 
+func configuredUpstreamKeys(cfg Config) []string {
+	if len(cfg.UpstreamAPIKeys) > 0 {
+		return cfg.UpstreamAPIKeys
+	}
+	return parseUpstreamAPIKeys(cfg.UpstreamAPIKey)
+}
+
+func upstreamKeyCooldown(cfg Config) time.Duration {
+	if cfg.UpstreamKeyCooldown > 0 {
+		return cfg.UpstreamKeyCooldown
+	}
+	return 30 * time.Second
+}
+
 func normalizeCacheOptimizerTTL(value string) string {
 	value = strings.TrimSpace(value)
 	if value == "" {

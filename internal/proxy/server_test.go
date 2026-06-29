@@ -63,6 +63,21 @@ func storeTestRoute(server *Server, model string, protocol RouteProtocol, endpoi
 	})
 }
 
+func newMultiKeyRouteAwareTestServer(upstreamBaseURL string, protocol RouteProtocol) *Server {
+	server := NewServer(Config{
+		UpstreamBaseURL:     upstreamBaseURL,
+		UpstreamAPIKey:      "sk-a,sk-b",
+		UpstreamAPIKeys:     []string{"sk-a", "sk-b"},
+		UpstreamKeyCooldown: secondsToDuration(30),
+		RequestTimeout:      secondsToDuration(5),
+		StreamTimeout:       secondsToDuration(5),
+		VerifySSL:           true,
+	})
+	server.routeResolver = nil
+	storeTestRoute(server, "test-model", protocol, defaultEndpointForProtocol(protocol))
+	return server
+}
+
 type recordingResolver struct {
 	route RouteEntry
 	ok    bool
@@ -956,13 +971,13 @@ func TestForwardResponsesAsChatInjectsConfiguredCacheTTL(t *testing.T) {
 	defer upstream.Close()
 
 	server := NewServer(Config{
-		UpstreamBaseURL:    upstream.URL + "/v1",
-		UpstreamAPIKey:     "upstream-secret",
-		RequestTimeout:     secondsToDuration(5),
-		StreamTimeout:      secondsToDuration(5),
-		VerifySSL:          true,
-		CacheOptimizer:     true,
-		CacheOptimizerTTL:  "5m",
+		UpstreamBaseURL:   upstream.URL + "/v1",
+		UpstreamAPIKey:    "upstream-secret",
+		RequestTimeout:    secondsToDuration(5),
+		StreamTimeout:     secondsToDuration(5),
+		VerifySSL:         true,
+		CacheOptimizer:    true,
+		CacheOptimizerTTL: "5m",
 	})
 	storeTestRoute(server, "chat-model", RouteProtocolChat, "/v1/chat/completions")
 
@@ -1496,6 +1511,169 @@ func TestResponsesEndpointForwardsCallerAuthWhenUpstreamKeyMissing(t *testing.T)
 	}
 }
 
+func TestResponsesEndpointRetriesWithNextKeyOnRateLimit(t *testing.T) {
+	var seenAuth []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		seenAuth = append(seenAuth, auth)
+		if auth == "Bearer sk-a" {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_ = json.NewEncoder(w).Encode(errorPayload("rate limited", "rate_limit_error", "rate_limit_exceeded"))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":      "chatcmpl-abc",
+			"created": 123,
+			"model":   "test-model",
+			"choices": []any{map[string]any{"finish_reason": "stop", "message": map[string]any{"role": "assistant", "content": "Hi"}}},
+		})
+	}))
+	defer upstream.Close()
+
+	server := newMultiKeyRouteAwareTestServer(upstream.URL+"/v1", RouteProtocolChat)
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"test-model","input":"hello"}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), "rate_limit_exceeded") {
+		t.Fatalf("expected proxy to hide upstream 429 body, got %s", recorder.Body.String())
+	}
+	assertJSONEqual(t, []string{"Bearer sk-a", "Bearer sk-b"}, seenAuth)
+}
+
+func TestChatCompletionsEndpointRetriesWithNextKeyOnRateLimit(t *testing.T) {
+	var seenAuth []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		seenAuth = append(seenAuth, auth)
+		if auth == "Bearer sk-a" {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_ = json.NewEncoder(w).Encode(errorPayload("rate limited", "rate_limit_error", "rate_limit_exceeded"))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":      "chatcmpl-abc",
+			"created": 123,
+			"model":   "test-model",
+			"choices": []any{map[string]any{"finish_reason": "stop", "message": map[string]any{"role": "assistant", "content": "Hi"}}},
+		})
+	}))
+	defer upstream.Close()
+
+	server := newMultiKeyRouteAwareTestServer(upstream.URL+"/v1", RouteProtocolChat)
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test-model","messages":[{"role":"user","content":"hello"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	assertJSONEqual(t, []string{"Bearer sk-a", "Bearer sk-b"}, seenAuth)
+}
+
+func TestMessagesEndpointRetriesWithNextKeyOnRateLimit(t *testing.T) {
+	var seenAuth []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		seenAuth = append(seenAuth, auth)
+		if auth == "Bearer sk-a" {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_ = json.NewEncoder(w).Encode(errorPayload("rate limited", "rate_limit_error", "rate_limit_exceeded"))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":      "msg_abc",
+			"type":    "message",
+			"role":    "assistant",
+			"model":   "test-model",
+			"content": []any{map[string]any{"type": "text", "text": "Hi"}},
+		})
+	}))
+	defer upstream.Close()
+
+	server := newMultiKeyRouteAwareTestServer(upstream.URL+"/v1", RouteProtocolMessages)
+	request := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"test-model","messages":[{"role":"user","content":"hello"}],"max_tokens":10}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	assertJSONEqual(t, []string{"Bearer sk-a", "Bearer sk-b"}, seenAuth)
+}
+
+func TestResponsesStreamRetriesWithNextKeyOnRateLimitBeforeWritingSSE(t *testing.T) {
+	var seenAuth []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		seenAuth = append(seenAuth, auth)
+		w.Header().Set("Content-Type", "text/event-stream")
+		if auth == "Bearer sk-a" {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte("data: " + mustJSON(errorPayload("rate limited", "rate_limit_error", "rate_limit_exceeded")) + "\n\n"))
+			return
+		}
+		_, _ = w.Write([]byte("data: " + mustJSON(map[string]any{
+			"id":      "chatcmpl-abc",
+			"created": 123,
+			"model":   "test-model",
+			"choices": []any{map[string]any{"delta": map[string]any{"role": "assistant", "content": "Hi"}, "finish_reason": nil}},
+		}) + "\n\n"))
+		_, _ = w.Write([]byte("data: " + mustJSON(map[string]any{
+			"id":      "chatcmpl-abc",
+			"created": 123,
+			"model":   "test-model",
+			"choices": []any{map[string]any{"delta": map[string]any{}, "finish_reason": "stop"}},
+		}) + "\n\n"))
+	}))
+	defer upstream.Close()
+
+	server := newMultiKeyRouteAwareTestServer(upstream.URL+"/v1", RouteProtocolChat)
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"test-model","input":"hello","stream":true}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	assertContains(t, recorder.Body.String(), "response.completed")
+	if strings.Contains(recorder.Body.String(), "rate_limit_exceeded") {
+		t.Fatalf("expected retry to hide upstream 429 body, got %s", recorder.Body.String())
+	}
+	assertJSONEqual(t, []string{"Bearer sk-a", "Bearer sk-b"}, seenAuth)
+}
+
+func TestResponsesEndpointReturns503WhenAllKeysAreRateLimited(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_ = json.NewEncoder(w).Encode(errorPayload("rate limited", "rate_limit_error", "rate_limit_exceeded"))
+	}))
+	defer upstream.Close()
+
+	server := newMultiKeyRouteAwareTestServer(upstream.URL+"/v1", RouteProtocolChat)
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"test-model","input":"hello"}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	assertContains(t, recorder.Body.String(), `"code":"upstream_keys_rate_limited"`)
+}
+
 func TestForwardUnknownV1Request(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/models" {
@@ -1520,6 +1698,141 @@ func TestForwardUnknownV1Request(t *testing.T) {
 		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
 	}
 	assertContains(t, recorder.Body.String(), `"id":"test-model"`)
+}
+
+func TestUnknownV1RequestRetriesWithNextKeyOnRateLimit(t *testing.T) {
+	var seenAuth []string
+	var seenBody []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		seenAuth = append(seenAuth, auth)
+		rawBody, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("failed to read upstream body: %v", err)
+		}
+		seenBody = append(seenBody, string(rawBody))
+		if auth == "Bearer sk-a" {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_ = json.NewEncoder(w).Encode(errorPayload("rate limited", "rate_limit_error", "rate_limit_exceeded"))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	}))
+	defer upstream.Close()
+
+	server := NewServer(Config{
+		UpstreamBaseURL:     upstream.URL + "/v1",
+		UpstreamAPIKey:      "sk-a,sk-b",
+		UpstreamAPIKeys:     []string{"sk-a", "sk-b"},
+		UpstreamKeyCooldown: secondsToDuration(30),
+		RequestTimeout:      secondsToDuration(5),
+		StreamTimeout:       secondsToDuration(5),
+		VerifySSL:           true,
+	})
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/embeddings", strings.NewReader(`{"input":"hello"}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	assertContains(t, recorder.Body.String(), `"ok":true`)
+	assertJSONEqual(t, []string{"Bearer sk-a", "Bearer sk-b"}, seenAuth)
+	assertJSONEqual(t, []string{`{"input":"hello"}`, `{"input":"hello"}`}, seenBody)
+}
+
+func TestUnknownV1RequestWithConfiguredKeysDoesNotRetryUnreplayableLargeBodyAfterRateLimit(t *testing.T) {
+	largeBody := strings.Repeat("x", (10<<20)+1)
+	var seenAuth []string
+	var seenBodySize []int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		seenAuth = append(seenAuth, auth)
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("failed to read upstream body: %v", err)
+		}
+		seenBodySize = append(seenBodySize, len(body))
+		if auth == "Bearer sk-a" {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_ = json.NewEncoder(w).Encode(errorPayload("rate limited", "rate_limit_error", "rate_limit_exceeded"))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	}))
+	defer upstream.Close()
+
+	server := NewServer(Config{
+		UpstreamBaseURL:     upstream.URL + "/v1",
+		UpstreamAPIKey:      "sk-a,sk-b",
+		UpstreamAPIKeys:     []string{"sk-a", "sk-b"},
+		UpstreamKeyCooldown: secondsToDuration(30),
+		RequestTimeout:      secondsToDuration(5),
+		StreamTimeout:       secondsToDuration(5),
+		VerifySSL:           true,
+	})
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/files", strings.NewReader(largeBody))
+	request.Header.Set("Content-Type", "application/octet-stream")
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	assertContains(t, recorder.Body.String(), `"code":"upstream_key_rate_limited_non_replayable"`)
+	if strings.Contains(recorder.Body.String(), "rate_limit_exceeded") {
+		t.Fatalf("expected proxy error instead of upstream 429 body, got %s", recorder.Body.String())
+	}
+	assertJSONEqual(t, []string{"Bearer sk-a"}, seenAuth)
+	assertJSONEqual(t, []int{len(largeBody)}, seenBodySize)
+}
+
+func TestUnknownV1RequestWithConfiguredKeysForwardsLargeBody(t *testing.T) {
+	largeBody := strings.Repeat("x", (10<<20)+1)
+	var seenAuth string
+	var seenBodySize int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenAuth = r.Header.Get("Authorization")
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("failed to read upstream body: %v", err)
+		}
+		seenBodySize = len(body)
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	}))
+	defer upstream.Close()
+
+	server := NewServer(Config{
+		UpstreamBaseURL:     upstream.URL + "/v1",
+		UpstreamAPIKey:      "sk-a,sk-b",
+		UpstreamAPIKeys:     []string{"sk-a", "sk-b"},
+		UpstreamKeyCooldown: secondsToDuration(30),
+		RequestTimeout:      secondsToDuration(5),
+		StreamTimeout:       secondsToDuration(5),
+		VerifySSL:           true,
+	})
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/files", strings.NewReader(largeBody))
+	request.Header.Set("Content-Type", "application/octet-stream")
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	assertContains(t, recorder.Body.String(), `"ok":true`)
+	if seenAuth != "Bearer sk-a" {
+		t.Fatalf("unexpected auth: %s", seenAuth)
+	}
+	if seenBodySize != len(largeBody) {
+		t.Fatalf("unexpected body size: got %d want %d", seenBodySize, len(largeBody))
+	}
 }
 
 func TestProxyAuthorization(t *testing.T) {

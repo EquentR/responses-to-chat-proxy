@@ -14,10 +14,10 @@ func TestSaveAndLoadLauncherConfig(t *testing.T) {
 
 	configPath := filepath.Join(t.TempDir(), "config.json")
 	config := map[string]string{
-		"upstream_base_url": "https://example.com/v1",
-		"upstream_api_key":  "sk-test",
-		"model_override":    "",
-		"cache_optimizer":   "true",
+		"upstream_base_url":   "https://example.com/v1",
+		"upstream_api_key":    "sk-test",
+		"model_override":      "",
+		"cache_optimizer":     "true",
 		"cache_optimizer_ttl": "5m",
 	}
 
@@ -56,10 +56,10 @@ func TestLoadLauncherConfigAcceptsUTF8BOM(t *testing.T) {
 	}
 
 	assertJSONEqual(t, map[string]string{
-		"upstream_base_url": "https://example.com/v1",
-		"upstream_api_key":  "sk-test",
-		"model_override":    "",
-		"cache_optimizer":   "true",
+		"upstream_base_url":   "https://example.com/v1",
+		"upstream_api_key":    "sk-test",
+		"model_override":      "",
+		"cache_optimizer":     "true",
 		"cache_optimizer_ttl": "5m",
 	}, loadLauncherConfig(configPath))
 }
@@ -97,9 +97,9 @@ func TestApplyRuntimeDefaults(t *testing.T) {
 	t.Setenv("CACHE_OPTIMIZER_TTL", "")
 
 	applyRuntimeDefaults(map[string]string{
-		"upstream_base_url": "https://example.com/v1",
-		"upstream_api_key":  "sk-test",
-		"cache_optimizer":   "true",
+		"upstream_base_url":   "https://example.com/v1",
+		"upstream_api_key":    "sk-test",
+		"cache_optimizer":     "true",
 		"cache_optimizer_ttl": "5m",
 	}, 8000)
 
@@ -212,5 +212,13 @@ func TestMaskAPIKey(t *testing.T) {
 	}
 	if maskAPIKey("short") != "*****" {
 		t.Fatalf("unexpected short masked key: %s", maskAPIKey("short"))
+	}
+}
+
+func TestMaskAPIKeys(t *testing.T) {
+	got := maskAPIKeys("sk-1234567890, sk-abcdef1234")
+	want := "sk-1...7890, sk-a...1234"
+	if got != want {
+		t.Fatalf("unexpected masked keys: got %q want %q", got, want)
 	}
 }

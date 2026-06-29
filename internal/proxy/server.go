@@ -14,12 +14,20 @@ import (
 	"time"
 )
 
+const maxUnknownV1ReplayBodyBytes int64 = 10 << 20
+
+var (
+	errAllUpstreamKeysRateLimited          = errors.New("all upstream api keys are rate limited")
+	errUpstreamKeyRateLimitedNonReplayable = errors.New("upstream api key rate limited and request body cannot be replayed")
+)
+
 type Server struct {
-	config       Config
-	routeTable   *RouteTable
+	config        Config
+	routeTable    *RouteTable
 	routeResolver RouteResolver
-	normalClient *http.Client
-	streamClient *http.Client
+	normalClient  *http.Client
+	streamClient  *http.Client
+	keySelector   *upstreamKeySelector
 }
 
 type RouteResolver interface {
@@ -42,13 +50,19 @@ func (e *routeProbeUnsupportedError) Error() string {
 }
 
 func NewServer(cfg Config) *Server {
+	upstreamKeys := configuredUpstreamKeys(cfg)
+	cfg.UpstreamAPIKeys = upstreamKeys
+	cooldown := upstreamKeyCooldown(cfg)
+	cfg.UpstreamKeyCooldown = cooldown
+
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: !cfg.VerifySSL}
 
 	return &Server{
-		config:     cfg,
-		routeTable: NewRouteTable(cfg.RouteTableTTL),
+		config:        cfg,
+		routeTable:    NewRouteTable(cfg.RouteTableTTL),
 		routeResolver: &lazyRouteResolver{},
+		keySelector:   newUpstreamKeySelector(upstreamKeys, cooldown),
 		normalClient: &http.Client{
 			Timeout:   cfg.RequestTimeout,
 			Transport: transport,
@@ -257,11 +271,11 @@ func (s *Server) forwardConvertedWithRectifier(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	response, err := s.doRequest(
+	response, err := s.doRequestWithKeyFailover(
 		r.Context(), s.normalClient, http.MethodPost,
 		s.config.UpstreamBaseURL+"/chat/completions",
-		copyHeaders(r.Header, s.config.UpstreamAPIKey),
-		bytes.NewReader(bodyBytes),
+		r.Header,
+		bodyBytes,
 	)
 	if err != nil {
 		s.writeUpstreamRequestError(w, err)
@@ -280,11 +294,11 @@ func (s *Server) forwardConvertedWithRectifier(w http.ResponseWriter, r *http.Re
 			stripped := cloneMap(chatRequest)
 			if StripThinkingBlocks(stripped) {
 				strippedBytes, _ := json.Marshal(stripped)
-				retryResp, retryErr := s.doRequest(
+				retryResp, retryErr := s.doRequestWithKeyFailover(
 					r.Context(), s.normalClient, http.MethodPost,
 					s.config.UpstreamBaseURL+"/chat/completions",
-					copyHeaders(r.Header, s.config.UpstreamAPIKey),
-					bytes.NewReader(strippedBytes),
+					r.Header,
+					strippedBytes,
 				)
 				if retryErr != nil {
 					s.writeUpstreamRequestError(w, retryErr)
@@ -327,7 +341,26 @@ func (s *Server) forwardUnknownV1(w http.ResponseWriter, r *http.Request) {
 		upstreamURL += "?" + rawQuery
 	}
 
-	response, err := s.doRequest(r.Context(), s.normalClient, r.Method, upstreamURL, copyHeaders(r.Header, s.config.UpstreamAPIKey), r.Body)
+	if !s.hasConfiguredUpstreamKeys() {
+		response, err := s.doRequest(r.Context(), s.normalClient, r.Method, upstreamURL, copyHeaders(r.Header, ""), r.Body)
+		if err != nil {
+			s.writeUpstreamRequestError(w, err)
+			return
+		}
+		defer response.Body.Close()
+
+		data := parseResponseJSON(response)
+		writeJSON(w, response.StatusCode, data)
+		return
+	}
+
+	body, err := readUnknownV1ReplayBody(r.Body, r.ContentLength)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errorPayload("Failed to read request body.", "invalid_request_error", "invalid_request_body"))
+		return
+	}
+
+	response, err := s.doRequestWithReplayBodyKeyFailover(r.Context(), s.normalClient, r.Method, upstreamURL, r.Header, body)
 	if err != nil {
 		s.writeUpstreamRequestError(w, err)
 		return
@@ -345,13 +378,13 @@ func (s *Server) forwardConvertedResponse(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	response, err := s.doRequest(
+	response, err := s.doRequestWithKeyFailover(
 		r.Context(),
 		s.normalClient,
 		http.MethodPost,
 		endpointURL,
-		copyHeaders(r.Header, s.config.UpstreamAPIKey),
-		bytes.NewReader(body),
+		r.Header,
+		body,
 	)
 	if err != nil {
 		s.writeUpstreamRequestError(w, err)
@@ -377,20 +410,10 @@ func (s *Server) streamResponses(w http.ResponseWriter, r *http.Request, _ map[s
 		return
 	}
 
-	headers := copyHeaders(r.Header, s.config.UpstreamAPIKey)
-	headers.Set("Accept", "text/event-stream")
-
 	ctx, cancel := context.WithTimeout(r.Context(), s.config.StreamTimeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpointURL, bytes.NewReader(body))
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, errorPayload("Failed to build upstream request.", "server_error", "request_build_failed"))
-		return
-	}
-	req.Header = headers
-
-	resp, err := s.streamClient.Do(req)
+	resp, err := s.doStreamRequestWithKeyFailover(ctx, http.MethodPost, endpointURL, r.Header, body, true)
 	if err != nil {
 		s.writeStreamFailure(w, err, NewStreamingConverter())
 		return
@@ -448,13 +471,13 @@ func (s *Server) forwardConvertedMessagesResponse(w http.ResponseWriter, r *http
 		return
 	}
 
-	response, err := s.doRequest(
+	response, err := s.doRequestWithKeyFailover(
 		r.Context(),
 		s.normalClient,
 		http.MethodPost,
 		endpointURL,
-		copyHeaders(r.Header, s.config.UpstreamAPIKey),
-		bytes.NewReader(body),
+		r.Header,
+		body,
 	)
 	if err != nil {
 		s.writeUpstreamRequestError(w, err)
@@ -480,27 +503,21 @@ func (s *Server) streamMessages(w http.ResponseWriter, r *http.Request, original
 		return
 	}
 
-	headers := copyHeaders(r.Header, s.config.UpstreamAPIKey)
-	headers.Set("Accept", "text/event-stream")
-
 	ctx, cancel := context.WithTimeout(r.Context(), s.config.StreamTimeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpointURL, bytes.NewReader(body))
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, errorPayload("Failed to build upstream request.", "server_error", "request_build_failed"))
-		return
-	}
-	req.Header = headers
-
-	resp, err := s.streamClient.Do(req)
+	resp, err := s.doStreamRequestWithKeyFailover(ctx, http.MethodPost, endpointURL, r.Header, body, true)
 	if err != nil {
 		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-cache, no-transform")
 		w.Header().Set("X-Accel-Buffering", "no")
 		w.WriteHeader(http.StatusOK)
 		flusher, _ := w.(http.Flusher)
-		writeSSEChunks(w, flusher, sseError(fmt.Sprintf("Upstream request failed: %v", err), "upstream_request_failed"))
+		if errors.Is(err, errAllUpstreamKeysRateLimited) {
+			writeSSEChunks(w, flusher, sseError("All upstream API keys are rate limited. Please retry later.", "upstream_keys_rate_limited"))
+		} else {
+			writeSSEChunks(w, flusher, sseError(fmt.Sprintf("Upstream request failed: %v", err), "upstream_request_failed"))
+		}
 		return
 	}
 	defer resp.Body.Close()
@@ -556,13 +573,13 @@ func (s *Server) passthroughNormal(w http.ResponseWriter, r *http.Request, body 
 		return
 	}
 
-	response, err := s.doRequest(
+	response, err := s.doRequestWithKeyFailover(
 		r.Context(),
 		s.normalClient,
 		http.MethodPost,
 		endpointURL,
-		copyHeaders(r.Header, s.config.UpstreamAPIKey),
-		bytes.NewReader(payload),
+		r.Header,
+		payload,
 	)
 	if err != nil {
 		s.writeUpstreamRequestError(w, err)
@@ -583,23 +600,17 @@ func (s *Server) passthroughStream(w http.ResponseWriter, r *http.Request, body 
 	ctx, cancel := context.WithTimeout(r.Context(), s.config.StreamTimeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpointURL, bytes.NewReader(payload))
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, errorPayload("Failed to build upstream request.", "server_error", "request_build_failed"))
-		return
-	}
-	req.Header = copyHeaders(r.Header, s.config.UpstreamAPIKey)
-	if protocol != RouteProtocolChat {
-		req.Header.Set("Accept", "text/event-stream")
-	}
-
-	resp, err := s.streamClient.Do(req)
+	resp, err := s.doStreamRequestWithKeyFailover(ctx, http.MethodPost, endpointURL, r.Header, payload, protocol != RouteProtocolChat)
 	if err != nil {
 		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-cache, no-transform")
 		w.Header().Set("X-Accel-Buffering", "no")
 		w.WriteHeader(http.StatusOK)
-		writeSSEChunks(w, nil, sseError(fmt.Sprintf("Upstream request failed: %v", err), "upstream_request_failed"))
+		if errors.Is(err, errAllUpstreamKeysRateLimited) {
+			writeSSEChunks(w, nil, sseError("All upstream API keys are rate limited. Please retry later.", "upstream_keys_rate_limited"))
+		} else {
+			writeSSEChunks(w, nil, sseError(fmt.Sprintf("Upstream request failed: %v", err), "upstream_request_failed"))
+		}
 		return
 	}
 	defer resp.Body.Close()
@@ -771,13 +782,13 @@ func (s *Server) probeProtocol(ctx context.Context, incoming http.Header, model 
 		return err
 	}
 
-	response, err := s.doRequest(
+	response, err := s.doRequestWithKeyFailover(
 		ctx,
 		s.normalClient,
 		http.MethodPost,
 		joinUpstreamEndpoint(s.config.UpstreamBaseURL, defaultEndpointForProtocol(protocol)),
-		copyHeaders(incoming, s.config.UpstreamAPIKey),
-		bytes.NewReader(body),
+		incoming,
+		body,
 	)
 	if err != nil {
 		return err
@@ -910,7 +921,171 @@ func (s *Server) doRequest(ctx context.Context, client *http.Client, method, url
 	return client.Do(req)
 }
 
+func (s *Server) hasConfiguredUpstreamKeys() bool {
+	s.keySelector.mu.Lock()
+	defer s.keySelector.mu.Unlock()
+	return len(s.keySelector.keys) > 0
+}
+
+func (s *Server) hasMultipleConfiguredUpstreamKeys() bool {
+	s.keySelector.mu.Lock()
+	defer s.keySelector.mu.Unlock()
+	return len(s.keySelector.keys) > 1
+}
+
+func (s *Server) doRequestWithKeyFailover(ctx context.Context, client *http.Client, method, url string, incomingHeaders http.Header, bodyBytes []byte) (*http.Response, error) {
+	attempts := s.keySelector.attempts()
+	if len(attempts) == 0 {
+		return nil, errAllUpstreamKeysRateLimited
+	}
+	retryRateLimited := s.hasMultipleConfiguredUpstreamKeys()
+
+	for _, attempt := range attempts {
+		resp, err := s.doRequest(ctx, client, method, url, copyHeaders(incomingHeaders, attempt.apiKey), bytes.NewReader(bodyBytes))
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode == http.StatusTooManyRequests && attempt.configured && retryRateLimited {
+			s.keySelector.markRateLimited(attempt)
+			resp.Body.Close()
+			continue
+		}
+		return resp, nil
+	}
+
+	return nil, errAllUpstreamKeysRateLimited
+}
+
+func (s *Server) doRequestWithReplayBodyKeyFailover(ctx context.Context, client *http.Client, method, url string, incomingHeaders http.Header, body *unknownV1ReplayBody) (*http.Response, error) {
+	attempts := s.keySelector.attempts()
+	if len(attempts) == 0 {
+		return nil, errAllUpstreamKeysRateLimited
+	}
+	retryRateLimited := s.hasMultipleConfiguredUpstreamKeys()
+
+	if !body.replayable {
+		attempt := attempts[0]
+		resp, err := s.doReplayBodyRequest(ctx, client, method, url, incomingHeaders, body, attempt)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode == http.StatusTooManyRequests && attempt.configured && retryRateLimited {
+			s.keySelector.markRateLimited(attempt)
+			resp.Body.Close()
+			return nil, errUpstreamKeyRateLimitedNonReplayable
+		}
+		return resp, nil
+	}
+
+	for _, attempt := range attempts {
+		resp, err := s.doReplayBodyRequest(ctx, client, method, url, incomingHeaders, body, attempt)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode == http.StatusTooManyRequests && attempt.configured && retryRateLimited {
+			s.keySelector.markRateLimited(attempt)
+			resp.Body.Close()
+			continue
+		}
+		return resp, nil
+	}
+
+	return nil, errAllUpstreamKeysRateLimited
+}
+
+func (s *Server) doReplayBodyRequest(ctx context.Context, client *http.Client, method, url string, incomingHeaders http.Header, body *unknownV1ReplayBody, attempt upstreamKeyAttempt) (*http.Response, error) {
+	reader, err := body.reader()
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, method, url, reader)
+	if err != nil {
+		return nil, err
+	}
+	req.Header = copyHeaders(incomingHeaders, attempt.apiKey)
+	if body.size >= 0 {
+		req.ContentLength = body.size
+	}
+	return client.Do(req)
+}
+
+func (s *Server) doStreamRequestWithKeyFailover(ctx context.Context, method, url string, incomingHeaders http.Header, bodyBytes []byte, acceptEventStream bool) (*http.Response, error) {
+	attempts := s.keySelector.attempts()
+	if len(attempts) == 0 {
+		return nil, errAllUpstreamKeysRateLimited
+	}
+	retryRateLimited := s.hasMultipleConfiguredUpstreamKeys()
+
+	for _, attempt := range attempts {
+		headers := copyHeaders(incomingHeaders, attempt.apiKey)
+		if acceptEventStream {
+			headers.Set("Accept", "text/event-stream")
+		}
+		req, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(bodyBytes))
+		if err != nil {
+			return nil, err
+		}
+		req.Header = headers
+
+		resp, err := s.streamClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode == http.StatusTooManyRequests && attempt.configured && retryRateLimited {
+			s.keySelector.markRateLimited(attempt)
+			resp.Body.Close()
+			continue
+		}
+		return resp, nil
+	}
+
+	return nil, errAllUpstreamKeysRateLimited
+}
+
+type unknownV1ReplayBody struct {
+	memory     []byte
+	direct     io.Reader
+	size       int64
+	replayable bool
+	used       bool
+}
+
+func readUnknownV1ReplayBody(body io.Reader, contentLength int64) (*unknownV1ReplayBody, error) {
+	if contentLength > maxUnknownV1ReplayBodyBytes {
+		return &unknownV1ReplayBody{direct: body, size: contentLength}, nil
+	}
+
+	raw, err := io.ReadAll(io.LimitReader(body, maxUnknownV1ReplayBodyBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(raw)) <= maxUnknownV1ReplayBodyBytes {
+		return &unknownV1ReplayBody{memory: raw, size: int64(len(raw)), replayable: true}, nil
+	}
+
+	return &unknownV1ReplayBody{direct: io.MultiReader(bytes.NewReader(raw), body), size: -1}, nil
+}
+
+func (b *unknownV1ReplayBody) reader() (io.Reader, error) {
+	if b.replayable {
+		return bytes.NewReader(b.memory), nil
+	}
+	if b.used {
+		return nil, errors.New("unknown v1 request body cannot be replayed")
+	}
+	b.used = true
+	return b.direct, nil
+}
+
 func (s *Server) writeUpstreamRequestError(w http.ResponseWriter, err error) {
+	if errors.Is(err, errAllUpstreamKeysRateLimited) {
+		writeJSON(w, http.StatusServiceUnavailable, errorPayload("All upstream API keys are rate limited. Please retry later.", "upstream_error", "upstream_keys_rate_limited"))
+		return
+	}
+	if errors.Is(err, errUpstreamKeyRateLimitedNonReplayable) {
+		writeJSON(w, http.StatusServiceUnavailable, errorPayload("Upstream API key is rate limited and this request body cannot be retried. Please retry later.", "upstream_error", "upstream_key_rate_limited_non_replayable"))
+		return
+	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		writeJSON(w, http.StatusGatewayTimeout, errorPayload("Request timeout. Please try again.", "timeout_error", "request_timeout"))
 		return
@@ -925,7 +1100,9 @@ func (s *Server) writeStreamFailure(w http.ResponseWriter, err error, converter 
 	w.WriteHeader(http.StatusOK)
 
 	flusher, _ := w.(http.Flusher)
-	if errors.Is(err, context.DeadlineExceeded) {
+	if errors.Is(err, errAllUpstreamKeysRateLimited) {
+		writeSSEChunks(w, flusher, sseError("All upstream API keys are rate limited. Please retry later.", "upstream_keys_rate_limited"))
+	} else if errors.Is(err, context.DeadlineExceeded) {
 		writeSSEChunks(w, flusher, sseError("Request timeout.", "request_timeout", "timeout_error"))
 	} else {
 		writeSSEChunks(w, flusher, sseError(fmt.Sprintf("Upstream request failed: %v", err), "upstream_request_failed"))

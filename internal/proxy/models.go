@@ -97,30 +97,52 @@ func (e *modelDiscoveryNoEvidenceError) Error() string {
 }
 
 func fetchModelDiscoveryPage(ctx context.Context, client *http.Client, cfg Config, incoming http.Header, candidate string) (modelDiscoveryPage, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, candidate, nil)
-	if err != nil {
-		return modelDiscoveryPage{}, err
+	selector := newUpstreamKeySelector(configuredUpstreamKeys(cfg), upstreamKeyCooldown(cfg))
+	attempts := selector.attempts()
+	if len(attempts) == 0 {
+		return modelDiscoveryPage{}, &modelDiscoveryError{
+			statusCode: http.StatusServiceUnavailable,
+			message:    "models discovery failed: all upstream API keys are rate limited",
+		}
 	}
-	req.Header = copyHeaders(incoming, cfg.UpstreamAPIKey)
-	req.Header.Set("Accept", "application/json")
+	retryRateLimited := len(configuredUpstreamKeys(cfg)) > 1
 
-	resp, err := client.Do(req)
-	if err != nil {
-		return modelDiscoveryPage{}, fmt.Errorf("models discovery failed: %w", err)
+	for _, attempt := range attempts {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, candidate, nil)
+		if err != nil {
+			return modelDiscoveryPage{}, err
+		}
+		req.Header = copyHeaders(incoming, attempt.apiKey)
+		req.Header.Set("Accept", "application/json")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return modelDiscoveryPage{}, fmt.Errorf("models discovery failed: %w", err)
+		}
+
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxModelsResponseBytes))
+		contentType := resp.Header.Get("Content-Type")
+		_ = resp.Body.Close()
+		if readErr != nil {
+			return modelDiscoveryPage{}, fmt.Errorf("models discovery failed reading upstream response: %w", readErr)
+		}
+
+		if resp.StatusCode == http.StatusTooManyRequests && attempt.configured && retryRateLimited {
+			selector.markRateLimited(attempt)
+			continue
+		}
+
+		return modelDiscoveryPage{
+			Body:        body,
+			StatusCode:  resp.StatusCode,
+			ContentType: contentType,
+		}, nil
 	}
 
-	body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxModelsResponseBytes))
-	contentType := resp.Header.Get("Content-Type")
-	_ = resp.Body.Close()
-	if readErr != nil {
-		return modelDiscoveryPage{}, fmt.Errorf("models discovery failed reading upstream response: %w", readErr)
+	return modelDiscoveryPage{}, &modelDiscoveryError{
+		statusCode: http.StatusServiceUnavailable,
+		message:    "models discovery failed: all upstream API keys are rate limited",
 	}
-
-	return modelDiscoveryPage{
-		Body:        body,
-		StatusCode:  resp.StatusCode,
-		ContentType: contentType,
-	}, nil
 }
 
 func discoverModelSelection(ctx context.Context, client *http.Client, cfg Config, incoming http.Header) (modelDiscoverySelection, error) {

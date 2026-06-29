@@ -558,6 +558,47 @@ func TestModelsDiscoveryStopsOnAuthOrRateLimitErrors(t *testing.T) {
 	}
 }
 
+func TestModelsDiscoveryRetriesWithNextKeyOnRateLimit(t *testing.T) {
+	var seenAuth []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		auth := r.Header.Get("Authorization")
+		seenAuth = append(seenAuth, auth)
+		if auth == "Bearer sk-a" {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_ = json.NewEncoder(w).Encode(errorPayload("rate limited", "rate_limit_error", "rate_limit_exceeded"))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data": []any{
+				map[string]any{"id": "gpt-5.1", "protocol": "responses"},
+			},
+		})
+	}))
+	defer upstream.Close()
+
+	cfg := Config{
+		UpstreamBaseURL:     upstream.URL,
+		UpstreamAPIKey:      "sk-a,sk-b",
+		UpstreamAPIKeys:     []string{"sk-a", "sk-b"},
+		UpstreamKeyCooldown: 30 * time.Second,
+		RequestTimeout:      secondsToDuration(5),
+		StreamTimeout:       secondsToDuration(5),
+		VerifySSL:           true,
+	}
+
+	results, err := DiscoverModels(context.Background(), &http.Client{Timeout: 5 * time.Second}, cfg)
+	if err != nil {
+		t.Fatalf("DiscoverModels returned error: %v", err)
+	}
+	if len(results) != 1 || results[0].ModelID != "gpt-5.1" {
+		t.Fatalf("unexpected discovery results: %#v", results)
+	}
+	assertJSONEqual(t, []string{"Bearer sk-a", "Bearer sk-b"}, seenAuth)
+}
+
 func TestModelsEndpointRefreshesRouteSnapshot(t *testing.T) {
 	t.Parallel()
 

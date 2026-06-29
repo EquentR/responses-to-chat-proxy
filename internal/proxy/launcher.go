@@ -107,7 +107,7 @@ func shouldReconfigure(config map[string]string, prompt PromptFunc, out io.Write
 
 	fmt.Fprintln(out, "Loaded saved upstream configuration:")
 	fmt.Fprintf(out, "  base_url: %s\n", config["upstream_base_url"])
-	fmt.Fprintf(out, "  api key : %s\n", maskAPIKey(config["upstream_api_key"]))
+	fmt.Fprintf(out, "  api keys: %s\n", maskAPIKeys(config["upstream_api_key"]))
 	answer, err := prompt("Press Enter to start, or type r to reconfigure: ")
 	if err != nil {
 		return false
@@ -131,7 +131,7 @@ func promptForConfig(existingConfig map[string]string, prompt PromptFunc) (map[s
 		return nil, err
 	}
 
-	upstreamAPIKey, err := promptSecretRequired(prompt, "Upstream api key: ")
+	upstreamAPIKey, err := promptSecretRequired(prompt, "Upstream api key(s), comma-separated for multiple keys: ")
 	if err != nil {
 		return nil, err
 	}
@@ -280,4 +280,16 @@ func maskAPIKey(apiKey string) string {
 		return strings.Repeat("*", len(apiKey))
 	}
 	return apiKey[:4] + "..." + apiKey[len(apiKey)-4:]
+}
+
+func maskAPIKeys(value string) string {
+	keys := parseUpstreamAPIKeys(value)
+	if len(keys) == 0 {
+		return ""
+	}
+	masked := make([]string, 0, len(keys))
+	for _, key := range keys {
+		masked = append(masked, maskAPIKey(key))
+	}
+	return strings.Join(masked, ", ")
 }
