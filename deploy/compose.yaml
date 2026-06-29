@@ -1,0 +1,12 @@
+services:
+  responses-to-chat-proxy:
+    image: ${IMAGE:-ghcr.io/equentr/responses-to-chat-proxy:latest}
+    container_name: ${CONTAINER_NAME:-responses-to-chat-proxy}
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8000
+    ports:
+      - "${HOST_PORT:-8000}:8000"
