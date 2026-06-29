@@ -1,4 +1,8 @@
-# responses-to-chat-proxy
+<h1 align="center">responses-to-chat-proxy</h1>
+
+<p align="center">
+  English | <a href="README.zh-CN.md">简体中文</a>
+</p>
 
 A small standalone Go proxy that keeps an OpenAI-compatible `Responses` endpoint on the downstream side and routes each request to the best-matching upstream protocol: native `Responses`, `Chat Completions`, or Anthropic-compatible `Messages`.
 
