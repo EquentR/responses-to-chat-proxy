@@ -10,27 +10,30 @@ import (
 )
 
 type Config struct {
-	UpstreamBaseURL       string
-	UpstreamModelsURL     string
-	UpstreamAPIKey        string
-	ReasoningMode         ReasoningMode // reasoning parameter mapping mode
-	RouteDetection        RouteDetectionMode
-	RouteTableTTLSeconds  float64
-	RouteTableTTL         time.Duration
-	RouteTablePersist     bool
-	RouteProbeGeneration  bool
-	ProxyAPIKey           string
-	ModelOverride         string
-	Host                  string
-	Port                  int
-	RequestTimeout        time.Duration
-	StreamTimeout         time.Duration
-	VerifySSL             bool
-	LogLevel              string
-	CacheOptimizer        bool // inject cache_control breakpoints
-	CacheOptimizerTTL     string
-	RequestTimeoutSeconds float64
-	StreamTimeoutSeconds  float64
+	UpstreamBaseURL            string
+	UpstreamModelsURL          string
+	UpstreamAPIKey             string
+	UpstreamAPIKeys            []string
+	UpstreamKeyCooldown        time.Duration
+	ReasoningMode              ReasoningMode // reasoning parameter mapping mode
+	RouteDetection             RouteDetectionMode
+	RouteTableTTLSeconds       float64
+	RouteTableTTL              time.Duration
+	RouteTablePersist          bool
+	RouteProbeGeneration       bool
+	ProxyAPIKey                string
+	ModelOverride              string
+	Host                       string
+	Port                       int
+	RequestTimeout             time.Duration
+	StreamTimeout              time.Duration
+	VerifySSL                  bool
+	LogLevel                   string
+	CacheOptimizer             bool // inject cache_control breakpoints
+	CacheOptimizerTTL          string
+	RequestTimeoutSeconds      float64
+	StreamTimeoutSeconds       float64
+	UpstreamKeyCooldownSeconds float64
 }
 
 func LoadConfigFromEnv(dotEnvPath string) (Config, error) {
@@ -39,17 +42,18 @@ func LoadConfigFromEnv(dotEnvPath string) (Config, error) {
 	}
 
 	cfg := Config{
-		UpstreamBaseURL:       envString("UPSTREAM_BASE_URL", "https://api.openai.com/v1"),
-		UpstreamModelsURL:     envString("UPSTREAM_MODELS_URL", ""),
-		UpstreamAPIKey:        envString("UPSTREAM_API_KEY", ""),
-		ProxyAPIKey:           envString("PROXY_API_KEY", ""),
-		ModelOverride:         envString("MODEL_OVERRIDE", ""),
-		Host:                  envString("HOST", "0.0.0.0"),
-		Port:                  envInt("PORT", 8000),
-		RequestTimeoutSeconds: envFloat("REQUEST_TIMEOUT_SECONDS", 120),
-		StreamTimeoutSeconds:  envFloat("STREAM_TIMEOUT_SECONDS", 300),
-		VerifySSL:             envBool("VERIFY_SSL", true),
-		LogLevel:              envString("LOG_LEVEL", "info"),
+		UpstreamBaseURL:            envString("UPSTREAM_BASE_URL", "https://api.openai.com/v1"),
+		UpstreamModelsURL:          envString("UPSTREAM_MODELS_URL", ""),
+		UpstreamAPIKey:             envString("UPSTREAM_API_KEY", ""),
+		ProxyAPIKey:                envString("PROXY_API_KEY", ""),
+		ModelOverride:              envString("MODEL_OVERRIDE", ""),
+		Host:                       envString("HOST", "0.0.0.0"),
+		Port:                       envInt("PORT", 8000),
+		RequestTimeoutSeconds:      envFloat("REQUEST_TIMEOUT_SECONDS", 120),
+		StreamTimeoutSeconds:       envFloat("STREAM_TIMEOUT_SECONDS", 300),
+		UpstreamKeyCooldownSeconds: envFloat("UPSTREAM_KEY_COOLDOWN_SECONDS", 30),
+		VerifySSL:                  envBool("VERIFY_SSL", true),
+		LogLevel:                   envString("LOG_LEVEL", "info"),
 		// ReasoningMode overrides model-name inference of the reasoning parameter
 		// form sent upstream. Empty falls back to model/base-URL inference. Allowed:
 		// effort, effort_obj, thinking, thinking_only, enable_thinking, reasoning_split.
@@ -63,8 +67,10 @@ func LoadConfigFromEnv(dotEnvPath string) (Config, error) {
 	}
 
 	cfg.UpstreamBaseURL = normalizeUpstreamBaseURL(cfg.UpstreamBaseURL)
+	cfg.UpstreamAPIKeys = parseUpstreamAPIKeys(cfg.UpstreamAPIKey)
 	cfg.RequestTimeout = secondsToDuration(cfg.RequestTimeoutSeconds)
 	cfg.StreamTimeout = secondsToDuration(cfg.StreamTimeoutSeconds)
+	cfg.UpstreamKeyCooldown = secondsToDuration(cfg.UpstreamKeyCooldownSeconds)
 	cfg.RouteTableTTLSeconds = normalizeRouteTableTTLSeconds(cfg.RouteTableTTLSeconds)
 	cfg.RouteTableTTL = secondsToDuration(cfg.RouteTableTTLSeconds)
 	cfg.CacheOptimizerTTL = normalizeCacheOptimizerTTL(cfg.CacheOptimizerTTL)
@@ -74,6 +80,21 @@ func LoadConfigFromEnv(dotEnvPath string) (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+func parseUpstreamAPIKeys(value string) []string {
+	fields := strings.FieldsFunc(value, func(r rune) bool {
+		return r == ',' || r == '\n' || r == '\r'
+	})
+
+	keys := make([]string, 0, len(fields))
+	for _, field := range fields {
+		key := strings.TrimSpace(field)
+		if key != "" {
+			keys = append(keys, key)
+		}
+	}
+	return keys
 }
 
 func normalizeCacheOptimizerTTL(value string) string {
