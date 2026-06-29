@@ -1555,9 +1555,6 @@ func convertUsage(rawUsage any) map[string]any {
 	if cachedTokens == 0 {
 		cachedTokens = intValue(usage["cache_read_input_tokens"])
 	}
-	if cc := intValue(usage["cache_creation_input_tokens"]); cc > 0 && cachedTokens == 0 {
-		cachedTokens = cc
-	}
 
 	reasoningTokens := 0
 	if completionDetails, ok := usage["completion_tokens_details"].(map[string]any); ok {
@@ -2298,11 +2295,7 @@ func (c *StreamingConverter) orderedFinalOutputItems() []finalStreamingOutputIte
 }
 
 func (c *StreamingConverter) buildUsage() map[string]any {
-	return map[string]any{
-		"input_tokens":  intValue(c.usage["prompt_tokens"]),
-		"output_tokens": intValue(c.usage["completion_tokens"]),
-		"total_tokens":  intValue(c.usage["total_tokens"]),
-	}
+	return convertUsage(c.usage)
 }
 
 func (c *StreamingConverter) allocateOutputIndex() int {

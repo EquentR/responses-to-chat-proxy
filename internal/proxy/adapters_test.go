@@ -391,6 +391,61 @@ func TestConvertResponseNonStreaming(t *testing.T) {
 	}
 }
 
+func TestConvertResponsePropagatesCacheReadTokens(t *testing.T) {
+	converted := ConvertResponse(map[string]any{
+		"id":      "chatcmpl-cache-read",
+		"created": 123,
+		"model":   "test-model",
+		"choices": []any{
+			map[string]any{
+				"finish_reason": "stop",
+				"message":       map[string]any{"role": "assistant", "content": "Hi"},
+			},
+		},
+		"usage": map[string]any{
+			"prompt_tokens":     20,
+			"completion_tokens": 3,
+			"total_tokens":      23,
+			"prompt_tokens_details": map[string]any{
+				"cached_tokens": 12,
+			},
+		},
+	}, map[string]any{"model": "test-model", "input": "Hello"})
+
+	usage := converted["usage"].(map[string]any)
+	inputDetails := usage["input_tokens_details"].(map[string]any)
+	if inputDetails["cached_tokens"] != 12 {
+		t.Fatalf("expected cached_tokens=12, got %#v", usage)
+	}
+}
+
+func TestConvertResponseDoesNotTreatCacheCreationAsCacheRead(t *testing.T) {
+	converted := ConvertResponse(map[string]any{
+		"id":      "chatcmpl-cache-creation",
+		"created": 123,
+		"model":   "test-model",
+		"choices": []any{
+			map[string]any{
+				"finish_reason": "stop",
+				"message":       map[string]any{"role": "assistant", "content": "Hi"},
+			},
+		},
+		"usage": map[string]any{
+			"prompt_tokens":               20,
+			"completion_tokens":           3,
+			"total_tokens":                23,
+			"cache_read_input_tokens":     0,
+			"cache_creation_input_tokens": 9,
+		},
+	}, map[string]any{"model": "test-model", "input": "Hello"})
+
+	usage := converted["usage"].(map[string]any)
+	inputDetails := usage["input_tokens_details"].(map[string]any)
+	if inputDetails["cached_tokens"] != 0 {
+		t.Fatalf("expected cached_tokens=0, got %#v", usage)
+	}
+}
+
 func TestReasoningExtractionCoversObjectShapeAndThinkTags(t *testing.T) {
 	converted := ConvertResponse(map[string]any{
 		"id":      "chatcmpl-abc",
@@ -1431,6 +1486,44 @@ func TestStreamingConverterTextDelta(t *testing.T) {
 	assertContains(t, events, "response.output_text.delta")
 	assertContains(t, events, "response.completed")
 	assertContains(t, events, "Hi")
+}
+
+func TestStreamingConverterPropagatesCacheReadTokens(t *testing.T) {
+	converter := NewStreamingConverter()
+	chunk := "data: " + mustJSON(map[string]any{
+		"id":      "chatcmpl-cache",
+		"created": 123,
+		"model":   "test-model",
+		"choices": []any{
+			map[string]any{"delta": map[string]any{"role": "assistant", "content": "Hi"}, "finish_reason": nil},
+		},
+	}) + "\n\n" + "data: " + mustJSON(map[string]any{
+		"id":      "chatcmpl-cache",
+		"created": 123,
+		"model":   "test-model",
+		"choices": []any{
+			map[string]any{"delta": map[string]any{}, "finish_reason": "stop"},
+		},
+		"usage": map[string]any{
+			"prompt_tokens":     20,
+			"completion_tokens": 3,
+			"total_tokens":      23,
+			"prompt_tokens_details": map[string]any{
+				"cached_tokens": 12,
+			},
+		},
+	}) + "\n\n"
+
+	completed := findPayload(ssePayloads(converter.Feed([]byte(chunk))), "response.completed")
+	if completed == nil {
+		t.Fatal("expected response.completed event")
+	}
+	response := completed["response"].(map[string]any)
+	usage := response["usage"].(map[string]any)
+	inputDetails := usage["input_tokens_details"].(map[string]any)
+	if inputDetails["cached_tokens"] != float64(12) {
+		t.Fatalf("expected cached_tokens=12, got %#v", usage)
+	}
 }
 
 func TestStreamingConverterToolOutputIndexStaysStableWhenMessageAddedLater(t *testing.T) {
