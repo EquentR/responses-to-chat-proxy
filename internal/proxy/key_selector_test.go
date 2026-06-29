@@ -31,6 +31,55 @@ func TestUpstreamKeySelectorRoundRobinsAvailableKeys(t *testing.T) {
 	}
 }
 
+func TestUpstreamKeySelectorStickyAttemptsUseSameKeyWithoutAdvancingRoundRobin(t *testing.T) {
+	selector := newUpstreamKeySelector([]string{"sk-a", "sk-b", "sk-c"}, 30*time.Second)
+
+	first := selector.stickyAttempts("conversation-a")
+	second := selector.stickyAttempts("conversation-a")
+	free := selector.attempts()
+
+	if len(first) == 0 || len(second) == 0 {
+		t.Fatalf("expected sticky attempts, got first=%#v second=%#v", first, second)
+	}
+	if first[0].apiKey != second[0].apiKey {
+		t.Fatalf("expected same sticky first key, got %q then %q", first[0].apiKey, second[0].apiKey)
+	}
+	if free[0].apiKey != "sk-a" {
+		t.Fatalf("sticky scheduling should not advance free round-robin cursor, got %#v", free[0])
+	}
+}
+
+func TestUpstreamKeySelectorStickyAttemptsFallBackToRoundRobinWhenKeyIsEmpty(t *testing.T) {
+	selector := newUpstreamKeySelector([]string{"sk-a", "sk-b"}, 30*time.Second)
+
+	first := selector.stickyAttempts("")
+	second := selector.stickyAttempts("")
+
+	if first[0].apiKey != "sk-a" || second[0].apiKey != "sk-b" {
+		t.Fatalf("empty sticky key should round-robin, got %q then %q", first[0].apiKey, second[0].apiKey)
+	}
+}
+
+func TestUpstreamKeySelectorStickyAttemptsSkipCoolingStickyKey(t *testing.T) {
+	now := time.Unix(100, 0)
+	selector := newUpstreamKeySelector([]string{"sk-a", "sk-b", "sk-c"}, 10*time.Second)
+	selector.now = func() time.Time { return now }
+
+	first := selector.stickyAttempts("conversation-a")
+	if len(first) == 0 {
+		t.Fatal("expected sticky attempts")
+	}
+	selector.markRateLimited(first[0])
+
+	second := selector.stickyAttempts("conversation-a")
+	if len(second) == 0 {
+		t.Fatal("expected fallback attempts while sticky key cools")
+	}
+	if second[0].apiKey == first[0].apiKey {
+		t.Fatalf("expected cooling sticky key to be skipped, got %#v", second)
+	}
+}
+
 func TestUpstreamKeySelectorSkipsCoolingKeysAndRecoversAfterCooldown(t *testing.T) {
 	now := time.Unix(100, 0)
 	selector := newUpstreamKeySelector([]string{"sk-a", "sk-b"}, 10*time.Second)

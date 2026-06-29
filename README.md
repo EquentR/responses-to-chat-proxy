@@ -48,7 +48,10 @@ REASONING_MODE=
 
 - In `.env`, use one key or multiple comma-separated keys for the same upstream base URL.
 - Process environment values may also contain newline-separated keys.
-- With multiple keys, the proxy round-robins requests.
+- With multiple keys, generation requests use sticky scheduling by default to improve upstream prompt-cache locality.
+- Sticky scheduling uses an explicit request identity when available: `metadata.sticky_key`, `metadata.session_id`, `metadata.conversation_id`, `metadata.thread_id`, `previous_response_id`, or `user`.
+- When no explicit identity is present, the proxy derives a cache-affinity key from stable prompt material such as `model`, `instructions`/system content, `tools`, and message history excluding the current tail.
+- Short stateless requests, route discovery, route probes, and unmatched `/v1/*` passthrough requests without a stable identity continue to use free round-robin scheduling.
 - If one of multiple configured keys returns 429, it is cooled down for `UPSTREAM_KEY_COOLDOWN_SECONDS` and the request is retried with the next available key rather than returning upstream 429 downstream.
 - Large unmatched `/v1/*` passthrough request bodies are sent in a single attempt and cannot be replayed for failover after upstream starts reading the body.
 - If `UPSTREAM_API_KEY` is empty, caller `Authorization`/`x-api-key`/`x-goog-api-key` passthrough remains unchanged.

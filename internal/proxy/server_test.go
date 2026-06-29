@@ -1611,6 +1611,124 @@ func TestResponsesEndpointRetriesWithNextKeyOnRateLimit(t *testing.T) {
 	assertJSONEqual(t, []string{"Bearer sk-a", "Bearer sk-b"}, seenAuth)
 }
 
+func TestResponsesEndpointUsesStickyKeyFromMetadata(t *testing.T) {
+	var seenAuth []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenAuth = append(seenAuth, r.Header.Get("Authorization"))
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":      "chatcmpl-abc",
+			"created": 123,
+			"model":   "test-model",
+			"choices": []any{map[string]any{"finish_reason": "stop", "message": map[string]any{"role": "assistant", "content": "Hi"}}},
+		})
+	}))
+	defer upstream.Close()
+
+	server := newMultiKeyRouteAwareTestServer(upstream.URL+"/v1", RouteProtocolChat)
+	for _, input := range []string{"first tail", "second tail"} {
+		request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"test-model","metadata":{"sticky_key":"conversation-a"},"input":"`+input+`"}`))
+		request.Header.Set("Content-Type", "application/json")
+		recorder := httptest.NewRecorder()
+
+		server.ServeHTTP(recorder, request)
+
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+		}
+	}
+
+	if len(seenAuth) != 2 {
+		t.Fatalf("expected two upstream calls, got %#v", seenAuth)
+	}
+	if seenAuth[0] != seenAuth[1] {
+		t.Fatalf("expected sticky requests to use the same key, got %#v", seenAuth)
+	}
+}
+
+func TestResponsesEndpointStickyKeyFailsOverWhenPreferredKeyRateLimited(t *testing.T) {
+	const stickyKey = "conversation-a"
+	probeSelector := newUpstreamKeySelector([]string{"sk-a", "sk-b", "sk-c"}, secondsToDuration(30))
+	preferred := "Bearer " + probeSelector.stickyAttempts("explicit:metadata.sticky_key:" + stickyKey)[0].apiKey
+
+	var seenAuth []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		seenAuth = append(seenAuth, auth)
+		if auth == preferred {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_ = json.NewEncoder(w).Encode(errorPayload("rate limited", "rate_limit_error", "rate_limit_exceeded"))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":      "chatcmpl-abc",
+			"created": 123,
+			"model":   "test-model",
+			"choices": []any{map[string]any{"finish_reason": "stop", "message": map[string]any{"role": "assistant", "content": "Hi"}}},
+		})
+	}))
+	defer upstream.Close()
+
+	server := NewServer(Config{
+		UpstreamBaseURL:     upstream.URL + "/v1",
+		UpstreamAPIKey:      "sk-a,sk-b,sk-c",
+		UpstreamAPIKeys:     []string{"sk-a", "sk-b", "sk-c"},
+		UpstreamKeyCooldown: secondsToDuration(30),
+		RequestTimeout:      secondsToDuration(5),
+		StreamTimeout:       secondsToDuration(5),
+		VerifySSL:           true,
+	})
+	server.routeResolver = nil
+	storeTestRoute(server, "test-model", RouteProtocolChat, "/v1/chat/completions")
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"test-model","metadata":{"sticky_key":"`+stickyKey+`"},"input":"hello"}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if len(seenAuth) != 2 {
+		t.Fatalf("expected preferred key plus one fallback, got %#v", seenAuth)
+	}
+	if seenAuth[0] != preferred {
+		t.Fatalf("expected first attempt to use sticky preferred key %q, got %#v", preferred, seenAuth)
+	}
+	if seenAuth[1] == preferred {
+		t.Fatalf("expected second attempt to skip cooling preferred key, got %#v", seenAuth)
+	}
+}
+
+func TestResponsesEndpointKeepsShortStatelessRequestsRoundRobin(t *testing.T) {
+	var seenAuth []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenAuth = append(seenAuth, r.Header.Get("Authorization"))
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":      "chatcmpl-abc",
+			"created": 123,
+			"model":   "test-model",
+			"choices": []any{map[string]any{"finish_reason": "stop", "message": map[string]any{"role": "assistant", "content": "Hi"}}},
+		})
+	}))
+	defer upstream.Close()
+
+	server := newMultiKeyRouteAwareTestServer(upstream.URL+"/v1", RouteProtocolChat)
+	for _, input := range []string{"hello", "world"} {
+		request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"test-model","input":"`+input+`"}`))
+		request.Header.Set("Content-Type", "application/json")
+		recorder := httptest.NewRecorder()
+
+		server.ServeHTTP(recorder, request)
+
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+		}
+	}
+
+	assertJSONEqual(t, []string{"Bearer sk-a", "Bearer sk-b"}, seenAuth)
+}
+
 func TestChatCompletionsEndpointRetriesWithNextKeyOnRateLimit(t *testing.T) {
 	var seenAuth []string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -276,6 +276,7 @@ func (s *Server) forwardConvertedWithRectifier(w http.ResponseWriter, r *http.Re
 		s.config.UpstreamBaseURL+"/chat/completions",
 		r.Header,
 		bodyBytes,
+		stickyRequestKey(original),
 	)
 	if err != nil {
 		s.writeUpstreamRequestError(w, err)
@@ -299,6 +300,7 @@ func (s *Server) forwardConvertedWithRectifier(w http.ResponseWriter, r *http.Re
 					s.config.UpstreamBaseURL+"/chat/completions",
 					r.Header,
 					strippedBytes,
+					stickyRequestKey(original),
 				)
 				if retryErr != nil {
 					s.writeUpstreamRequestError(w, retryErr)
@@ -385,6 +387,7 @@ func (s *Server) forwardConvertedResponse(w http.ResponseWriter, r *http.Request
 		endpointURL,
 		r.Header,
 		body,
+		stickyRequestKey(originalRequest),
 	)
 	if err != nil {
 		s.writeUpstreamRequestError(w, err)
@@ -401,7 +404,7 @@ func (s *Server) forwardConvertedResponse(w http.ResponseWriter, r *http.Request
 	writeJSON(w, response.StatusCode, ConvertResponse(responseData, originalRequest))
 }
 
-func (s *Server) streamResponses(w http.ResponseWriter, r *http.Request, _ map[string]any, chatRequest map[string]any, endpointURL string) {
+func (s *Server) streamResponses(w http.ResponseWriter, r *http.Request, originalRequest map[string]any, chatRequest map[string]any, endpointURL string) {
 	streamBody := cloneMap(chatRequest)
 	streamBody["stream"] = true
 	body, err := json.Marshal(streamBody)
@@ -413,7 +416,7 @@ func (s *Server) streamResponses(w http.ResponseWriter, r *http.Request, _ map[s
 	ctx, cancel := context.WithTimeout(r.Context(), s.config.StreamTimeout)
 	defer cancel()
 
-	resp, err := s.doStreamRequestWithKeyFailover(ctx, http.MethodPost, endpointURL, r.Header, body, true)
+	resp, err := s.doStreamRequestWithKeyFailover(ctx, http.MethodPost, endpointURL, r.Header, body, true, stickyRequestKey(originalRequest))
 	if err != nil {
 		if errors.Is(err, errAllUpstreamKeysRateLimited) {
 			s.writeUpstreamRequestError(w, err)
@@ -482,6 +485,7 @@ func (s *Server) forwardConvertedMessagesResponse(w http.ResponseWriter, r *http
 		endpointURL,
 		r.Header,
 		body,
+		stickyRequestKey(originalRequest),
 	)
 	if err != nil {
 		s.writeUpstreamRequestError(w, err)
@@ -510,7 +514,7 @@ func (s *Server) streamMessages(w http.ResponseWriter, r *http.Request, original
 	ctx, cancel := context.WithTimeout(r.Context(), s.config.StreamTimeout)
 	defer cancel()
 
-	resp, err := s.doStreamRequestWithKeyFailover(ctx, http.MethodPost, endpointURL, r.Header, body, true)
+	resp, err := s.doStreamRequestWithKeyFailover(ctx, http.MethodPost, endpointURL, r.Header, body, true, stickyRequestKey(originalRequest))
 	if err != nil {
 		if errors.Is(err, errAllUpstreamKeysRateLimited) {
 			s.writeUpstreamRequestError(w, err)
@@ -588,6 +592,7 @@ func (s *Server) passthroughNormal(w http.ResponseWriter, r *http.Request, body 
 		endpointURL,
 		r.Header,
 		payload,
+		stickyRequestKeyFromBody(body),
 	)
 	if err != nil {
 		s.writeUpstreamRequestError(w, err)
@@ -608,7 +613,7 @@ func (s *Server) passthroughStream(w http.ResponseWriter, r *http.Request, body 
 	ctx, cancel := context.WithTimeout(r.Context(), s.config.StreamTimeout)
 	defer cancel()
 
-	resp, err := s.doStreamRequestWithKeyFailover(ctx, http.MethodPost, endpointURL, r.Header, payload, protocol != RouteProtocolChat)
+	resp, err := s.doStreamRequestWithKeyFailover(ctx, http.MethodPost, endpointURL, r.Header, payload, protocol != RouteProtocolChat, stickyRequestKey(body))
 	if err != nil {
 		if errors.Is(err, errAllUpstreamKeysRateLimited) {
 			s.writeUpstreamRequestError(w, err)
@@ -801,6 +806,7 @@ func (s *Server) probeProtocol(ctx context.Context, incoming http.Header, model 
 		joinUpstreamEndpoint(s.config.UpstreamBaseURL, defaultEndpointForProtocol(protocol)),
 		incoming,
 		body,
+		"",
 	)
 	if err != nil {
 		return err
@@ -945,8 +951,8 @@ func (s *Server) hasMultipleConfiguredUpstreamKeys() bool {
 	return len(s.keySelector.keys) > 1
 }
 
-func (s *Server) doRequestWithKeyFailover(ctx context.Context, client *http.Client, method, url string, incomingHeaders http.Header, bodyBytes []byte) (*http.Response, error) {
-	attempts := s.keySelector.attempts()
+func (s *Server) doRequestWithKeyFailover(ctx context.Context, client *http.Client, method, url string, incomingHeaders http.Header, bodyBytes []byte, stickyKey string) (*http.Response, error) {
+	attempts := s.keySelector.stickyAttempts(stickyKey)
 	if len(attempts) == 0 {
 		return nil, errAllUpstreamKeysRateLimited
 	}
@@ -1021,8 +1027,8 @@ func (s *Server) doReplayBodyRequest(ctx context.Context, client *http.Client, m
 	return client.Do(req)
 }
 
-func (s *Server) doStreamRequestWithKeyFailover(ctx context.Context, method, url string, incomingHeaders http.Header, bodyBytes []byte, acceptEventStream bool) (*http.Response, error) {
-	attempts := s.keySelector.attempts()
+func (s *Server) doStreamRequestWithKeyFailover(ctx context.Context, method, url string, incomingHeaders http.Header, bodyBytes []byte, acceptEventStream bool, stickyKey string) (*http.Response, error) {
+	attempts := s.keySelector.stickyAttempts(stickyKey)
 	if len(attempts) == 0 {
 		return nil, errAllUpstreamKeysRateLimited
 	}
